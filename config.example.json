@@ -1,0 +1,72 @@
+{
+    "_comment": "Copy this file to config.json and change only what you need.",
+    "_comment2": "Any value you omit will use the built-in default.",
+
+    "default_model": "small",
+    "language": "en",
+    "compute_type": "int8",
+    "device": "cpu",
+
+    "batch_sizes": {
+        "_comment": "Higher = faster but more RAM. Tuned for M1 16GB.",
+        "tiny": 32,
+        "base": 24,
+        "small": 16,
+        "medium": 8,
+        "large-v3": 4
+    },
+
+    "paths": {
+        "_comment": "Change obsidian_base to your vault location.",
+        "obsidian_base": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Interviews",
+        "recordings_subdir": "Recordings",
+        "scripts_subdir": "Scripts"
+    },
+
+    "recording": {
+        "sample_rate": 16000,
+        "silence_threshold": 0.005,
+        "silence_timeout_minutes": 10,
+        "blackhole_device": "BlackHole 2ch",
+        "mic_low_warning_seconds": 10
+    },
+
+    "diarization": {
+        "enabled": true,
+        "model": "pyannote/speaker-diarization-3.1"
+    },
+
+    "live": {
+        "_comment": "Adaptive scaling auto-adjusts chunk_interval and batch_size during recording.",
+        "chunk_interval_seconds": 120,
+        "min_chunk_interval": 60,
+        "max_chunk_interval": 300,
+        "chunk_overlap_seconds": 5,
+        "min_chunk_seconds": 30,
+        "struggle_ratio": 0.7,
+        "rec_only_ratio": 1.5
+    },
+
+    "speaker_memory": {
+        "enabled": true,
+        "similarity_threshold": 0.75,
+        "embedding_model": "pyannote/embedding",
+        "enrollment_duration_seconds": 15
+    },
+
+    "watch": {
+        "_comment": "calendars: [] = watch all. Set ['Work'] to filter.",
+        "silence_timeout_minutes": 10,
+        "min_recording_minutes": 2,
+        "model": "small",
+        "calendars": [],
+        "end_buffer_minutes": 2,
+        "refresh_hours": 3
+    },
+
+    "list": {
+        "max_recordings": 20
+    },
+
+    "user_name": ""
+}

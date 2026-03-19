@@ -1,0 +1,12 @@
+#!/bin/bash
+# Interview Transcriber — Record, transcribe, save to Obsidian
+#
+# Usage:
+#   transcribe rec                              Record an interview
+#   transcribe run                              Transcribe last recording
+#   transcribe run ~/Downloads/interview.mp3    Transcribe a specific file
+#   transcribe list                             List & manage recordings
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="/opt/homebrew/bin:$PATH"
+"$SCRIPT_DIR/.venv/bin/python3" "$SCRIPT_DIR/transcriber.py" "$@"
