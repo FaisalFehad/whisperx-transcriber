@@ -25,7 +25,7 @@ Built on [WhisperX](https://github.com/m-bain/whisperX) (OpenAI Whisper + pyanno
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/whisperx-transcriber.git
+git clone https://github.com/FaisalFehad/whisperx-transcriber.git
 cd whisperx-transcriber
 ./install.sh
 source ~/.zshrc
