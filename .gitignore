@@ -15,6 +15,12 @@ recordings/
 
 # Logs
 *.log
+watch-stdout.log
+watch-stderr.log
 
 # macOS
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
