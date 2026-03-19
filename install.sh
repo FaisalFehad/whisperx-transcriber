@@ -2,7 +2,7 @@
 # Interview Transcriber — Install Script
 #
 # Usage:
-#   git clone https://github.com/faisalfs/whisperx-transcriber.git
+#   git clone https://github.com/YOUR_USERNAME/whisperx-transcriber.git
 #   cd whisperx-transcriber
 #   ./install.sh
 

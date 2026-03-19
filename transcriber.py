@@ -21,7 +21,6 @@ import select
 import subprocess
 import sys
 import termios
-import traceback
 import threading
 import time
 import tty
@@ -1701,11 +1700,13 @@ def load_speaker_profiles():
         return profiles
     for f in SPEAKERS_DIR.glob("*.npz"):
         try:
-            data = np.load(f, allow_pickle=True)
-            profiles[f.stem] = {
-                "name": str(data["name"]),
-                "embedding": data["embedding"],
-            }
+            with np.load(f, allow_pickle=True) as data:
+                if "name" not in data or "embedding" not in data:
+                    continue
+                profiles[f.stem] = {
+                    "name": str(data["name"]),
+                    "embedding": np.array(data["embedding"]),
+                }
         except Exception:
             continue
     return profiles
@@ -1733,7 +1734,9 @@ def match_speakers(speaker_embeddings, saved_profiles, threshold=0.75):
         if spk_emb is None:
             continue
         for prof_key, profile in saved_profiles.items():
-            prof_emb = profile["embedding"]
+            prof_emb = profile.get("embedding")
+            if prof_emb is None:
+                continue
             similarity = float(np.dot(spk_emb, prof_emb) / (
                 np.linalg.norm(spk_emb) * np.linalg.norm(prof_emb) + 1e-8
             ))
@@ -2230,6 +2233,12 @@ def cmd_install_daemon(args):
     if not venv_python.exists():
         print("  ❌ Virtual environment not found. Run install.sh first.")
         return
+
+    if not HF_TOKEN:
+        print("  ⚠  HF_TOKEN not set — diarization won't work in background daemon.")
+        print("     Set it with: export HF_TOKEN=your_token_here")
+        print("     Then re-run: transcribe install-daemon")
+        print()
 
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
