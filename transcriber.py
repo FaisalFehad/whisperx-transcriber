@@ -41,9 +41,10 @@ CONFIG_PATH = SCRIPT_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     # ── General ──────────────────────────────────────────────────────────
-    # Whisper model: tiny/base/small/medium/large-v3
-    # Recommended: "small" — best balance of speed and accuracy on M1 16GB
-    "default_model": "small",
+    # Whisper model: tiny/base/small/medium/turbo/large-v3
+    # Use .en variants for English-only (more accurate): tiny.en, base.en, small.en, medium.en
+    # Recommended: "small.en" for English, "small" for other languages
+    "default_model": "small.en",
     # Language code for transcription (e.g. "en", "ar", "fr")
     # Set to avoid misdetection — auto-detect can pick wrong language
     "language": "en",
@@ -57,7 +58,9 @@ DEFAULT_CONFIG = {
     # Higher = faster but more RAM. These are tuned for M1 16GB.
     # Reduce if you get memory errors; increase on machines with more RAM.
     "batch_sizes": {
-        "tiny": 32, "base": 24, "small": 16, "medium": 8, "large-v3": 4
+        "tiny": 32, "tiny.en": 32, "base": 24, "base.en": 24,
+        "small": 16, "small.en": 16, "medium": 8, "medium.en": 8,
+        "turbo": 4, "large-v3": 4
     },
 
     # ── File paths ───────────────────────────────────────────────────────
@@ -161,11 +164,16 @@ DEFAULT_CONFIG = {
     # speed_factor: multiplier for time estimation (audio_duration × factor)
     # Lower = faster model. These are calibrated for M1 Apple Silicon.
     "models": {
-        "tiny":     {"speed_factor": 0.1,  "description": "fastest, least accurate",    "size": "~75MB"},
-        "base":     {"speed_factor": 0.2,  "description": "fast, good for clear audio", "size": "~140MB"},
-        "small":    {"speed_factor": 0.5,  "description": "balanced (recommended)",     "size": "~460MB"},
-        "medium":   {"speed_factor": 1.5,  "description": "slow, more accurate",        "size": "~1.5GB"},
-        "large-v3": {"speed_factor": 4.0,  "description": "slowest, most accurate",     "size": "~3GB"},
+        "tiny":     {"speed_factor": 0.1,  "description": "fastest, least accurate",       "size": "~75MB"},
+        "tiny.en":  {"speed_factor": 0.1,  "description": "fastest, English-only",        "size": "~75MB"},
+        "base":     {"speed_factor": 0.2,  "description": "fast, good for clear audio",   "size": "~140MB"},
+        "base.en":  {"speed_factor": 0.2,  "description": "fast, English-only",           "size": "~140MB"},
+        "small":    {"speed_factor": 0.5,  "description": "balanced, multilingual",       "size": "~460MB"},
+        "small.en": {"speed_factor": 0.5,  "description": "balanced, English-only (recommended)", "size": "~460MB"},
+        "medium":   {"speed_factor": 1.5,  "description": "slow, multilingual",           "size": "~1.5GB"},
+        "medium.en":{"speed_factor": 1.5,  "description": "slow, English-only",           "size": "~1.5GB"},
+        "turbo":    {"speed_factor": 0.8,  "description": "fast + accurate (best value)", "size": "~1.6GB"},
+        "large-v3": {"speed_factor": 4.0,  "description": "slowest, most accurate",      "size": "~3GB"},
     },
 }
 

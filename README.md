@@ -177,11 +177,16 @@ You can filter which calendars to watch in `config.json`.
 
 | Model | Speed | Accuracy | RAM | Size |
 |-------|-------|----------|-----|------|
-| tiny | Fastest | Low | ~1GB | ~75MB |
-| base | Fast | Good | ~1.5GB | ~140MB |
-| **small** | **Balanced** | **Recommended** | **~3GB** | **~460MB** |
-| medium | Slow | High | ~5GB | ~1.5GB |
+| tiny / tiny.en | Fastest | Low | ~1GB | ~75MB |
+| base / base.en | Fast | Good | ~1.5GB | ~140MB |
+| **small / small.en** | **Balanced** | **Recommended** | **~3GB** | **~460MB** |
+| medium / medium.en | Slow | High | ~5GB | ~1.5GB |
+| **turbo** | **Fast** | **Near-best** | **~6GB** | **~1.6GB** |
 | large-v3 | Slowest | Highest | ~10GB | ~3GB |
+
+**`.en` models** are English-only — more accurate for English since they don't split capacity across 99 languages. Use `small.en` (default) for English, `small` for other languages.
+
+`turbo` is a distilled version of `large-v3` — nearly the same accuracy but ~8x faster. Best choice if you have 16GB+ RAM.
 
 Speed depends on your hardware. On M1 16GB, `small` processes about 2x faster than realtime.
 
