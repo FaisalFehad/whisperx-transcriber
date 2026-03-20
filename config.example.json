@@ -87,6 +87,9 @@
         "enrollment_duration_seconds": 15
     },
 
+    "_comment_auto_title": "Use calendar event name as transcript title when recording during a meeting.",
+    "auto_title_from_calendar": true,
+
     "watch": {
         "_comment": "calendars: [] = watch all. Set ['Work'] to filter.",
         "silence_timeout_minutes": 10,

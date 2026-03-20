@@ -1,5 +1,5 @@
 #!/bin/bash
-# Interview Transcriber — Install Script
+# Transcriber — Install Script
 #
 # Usage:
 #   git clone https://github.com/FaisalFehad/whisperx-transcriber.git
@@ -13,7 +13,7 @@ SHELL_RC="$HOME/.zshrc"
 
 echo ""
 echo "┌─────────────────────────────────────────────┐"
-echo "│  Interview Transcriber — Installer          │"
+echo "│  Transcriber — Installer                    │"
 echo "└─────────────────────────────────────────────┘"
 echo ""
 
@@ -73,7 +73,7 @@ if grep -q "alias transcribe=" "$SHELL_RC" 2>/dev/null; then
     echo "  ✅ Shell alias already exists in $SHELL_RC"
 else
     echo "" >> "$SHELL_RC"
-    echo "# Interview Transcriber (WhisperX)" >> "$SHELL_RC"
+    echo "# Transcriber" >> "$SHELL_RC"
     echo "$ALIAS_LINE" >> "$SHELL_RC"
     echo "  ✅ Added 'transcribe' alias to $SHELL_RC"
 fi
@@ -113,7 +113,7 @@ echo "│  Reload your shell:  source ~/.zshrc        │"
 echo "│                                             │"
 echo "│  Quick start:                               │"
 echo "│    transcribe setup   — Audio setup guide   │"
-echo "│    transcribe rec     — Record interview    │"
+echo "│    transcribe rec     — Record audio        │"
 echo "│    transcribe run     — Transcribe          │"
 echo "│    transcribe list    — Browse recordings   │"
 echo "│                                             │"
