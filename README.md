@@ -89,14 +89,37 @@ transcribe live                   # Record + transcribe simultaneously
 | `transcribe watch-status` | Check if watch daemon is running |
 | `transcribe setup` | Audio device setup guide |
 
-### Transcription Options
+### Transcribe an Audio File
+
+Convert any audio file to a transcript. Supported formats: **MP3, WAV, M4A, OGG, FLAC, WebM**.
 
 ```bash
-transcribe run file.mp3 -m medium         # Choose model (default: small)
-transcribe run file.mp3 -s "Alice,Bob"    # Name the speakers
-transcribe run file.mp3 -t "Session"    # Set title
-transcribe run file.mp3 -l en             # Set language
-transcribe run file.mp3 --no-diarize      # Skip speaker ID (faster)
+transcribe run ~/Downloads/audio.mp3
+```
+
+That's it — the transcript is saved as Markdown to your Obsidian vault.
+
+**Options:**
+
+| Flag | Example | What it does |
+|------|---------|-------------|
+| `-m` | `-m medium` | Use a different model (default: small) |
+| `-t` | `-t "Team Meeting"` | Set the transcript title |
+| `-s` | `-s "Alice,Bob"` | Name the speakers |
+| `-l` | `-l ar` | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
+| `--no-diarize` | | Skip speaker identification (faster) |
+
+**Examples:**
+
+```bash
+# Basic — just transcribe
+transcribe run ~/Downloads/audio.mp3
+
+# With title and speaker names
+transcribe run ~/Downloads/audio.mp3 -t "Session with Jane" -s "Jane,Faisal"
+
+# Fast mode — no speaker ID
+transcribe run ~/Downloads/audio.mp3 --no-diarize
 ```
 
 ### Live Mode

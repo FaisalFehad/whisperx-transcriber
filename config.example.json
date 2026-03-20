@@ -3,6 +3,7 @@
     "_comment2": "Any value you omit will use the built-in default.",
 
     "default_model": "small",
+    "_comment_language": "Supported languages: https://github.com/openai/whisper#available-models-and-languages",
     "language": "en",
     "compute_type": "int8",
     "device": "cpu",
@@ -63,6 +64,9 @@
         "end_buffer_minutes": 2,
         "refresh_hours": 3
     },
+
+    "_comment_formats": "Supported audio formats: MP3, WAV, M4A, OGG, FLAC, WebM",
+    "audio_formats": [".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm"],
 
     "list": {
         "max_recordings": 20
