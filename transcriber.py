@@ -49,10 +49,11 @@ DEFAULT_CONFIG = {
     # mlx uses Apple's Metal GPU via MLX framework — ~7x faster on Apple Silicon
     # whisperx uses faster-whisper on CPU — works everywhere, has built-in alignment
     "engine": "mlx",
-    # Whisper model: tiny/base/small/medium/turbo/large-v3
-    # Use .en variants for English-only (more accurate): tiny.en, base.en, small.en, medium.en
-    # Recommended: "small.en" for English, "small" for other languages
-    "default_model": "small.en",
+    # Transcription model: "parakeet" (recommended) or Whisper variants
+    # Parakeet: CTC model — no hallucinations, proper punctuation, 2.5GB
+    # Whisper: tiny/base/small/medium/turbo/large-v3 (.en variants for English)
+    # Recommended: "parakeet" for accuracy, "small.en" for low RAM
+    "default_model": "parakeet",
     # Language code for transcription (e.g. "en", "ar", "fr")
     # Set to avoid misdetection — auto-detect can pick wrong language
     "language": "en",
@@ -105,6 +106,14 @@ DEFAULT_CONFIG = {
     # Falls back to date-only if no event is happening or calendar unavailable
     "auto_title_from_calendar": True,
 
+    # ── Whisper-specific settings ────────────────────────────────────────
+    # Only used when default_model is a Whisper model (not parakeet)
+    "whisper": {
+        # Skip silent segments where hallucination is detected (seconds).
+        # Set to None to disable. Requires word_timestamps=True internally.
+        "hallucination_silence_threshold": 2.0,
+    },
+
     # ── Speaker diarization (who said what) ──────────────────────────────
     "diarization": {
         # Set to false to always skip diarization (faster, no speaker labels)
@@ -118,6 +127,12 @@ DEFAULT_CONFIG = {
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
         # Chunk duration in seconds for streaming mode (lower = less RAM)
         "mlx_chunk_duration": 10.0,
+        # Speaker activity threshold (0-1). Lower = catch more speech, higher = fewer false positives
+        "threshold": 0.5,
+        # Ignore speaker segments shorter than this (seconds). Filters micro-segments
+        "min_duration": 0.0,
+        # Merge segments from same speaker closer than this gap (seconds). Reduces fragmentation
+        "merge_gap": 0.0,
     },
 
     # ── Live mode (record + transcribe simultaneously) ───────────────────
@@ -178,6 +193,20 @@ DEFAULT_CONFIG = {
         "record_only": True,
     },
 
+    # ── Audio denoising (Whisper only — Parakeet skips this) ────────────
+    "denoise": {
+        # Spectral subtraction to reduce background noise before Whisper transcription.
+        # Parakeet doesn't need this (CTC architecture can't hallucinate on silence).
+        # Uses first N seconds as noise profile — works best when audio starts
+        # with silence or hold music (before speech begins).
+        "enabled": True,
+        # Over-subtraction factor: how aggressively to remove noise.
+        # 2.0 = balanced (recommended). Higher = more removal but risks speech distortion.
+        "factor": 2.0,
+        # Seconds of audio to use as noise profile (from start of file).
+        "noise_profile_seconds": 10,
+    },
+
     # ── List command ─────────────────────────────────────────────────────
     "list": {
         # Max recordings to show in 'transcribe list'
@@ -203,6 +232,7 @@ DEFAULT_CONFIG = {
         "turbo":    {"speed_factor": 0.8,  "description": "fast + accurate (best value)", "size": "~1.6GB"},
         "large-v3": {"speed_factor": 4.0,  "description": "slowest, most accurate",      "size": "~3GB"},
         "large-v3.en": {"speed_factor": 4.0, "description": "most accurate, English-only", "size": "~3GB"},
+        "parakeet":     {"speed_factor": 0.5, "description": "CTC — no hallucinations, best accuracy", "size": "~2.5GB"},
     },
 
     # ── MLX model repos (HuggingFace) ────────────────────────────────
@@ -219,6 +249,7 @@ DEFAULT_CONFIG = {
         "turbo":      "mlx-community/whisper-large-v3-turbo",
         "large-v3":   "mlx-community/whisper-large-v3-mlx",
         "large-v3.en":"mlx-community/whisper-large-v3-mlx",
+        "parakeet":   "mlx-community/parakeet-tdt-0.6b-v3",
     },
 }
 
@@ -1927,6 +1958,62 @@ class ProgressTracker:
             time.sleep(0.3)
 
 
+# ─── Audio Denoising ─────────────────────────────────────────────────────────
+
+def _denoise_audio(audio_path):
+    """Apply spectral subtraction denoising to an audio file.
+
+    Uses the first N seconds as a noise profile, then subtracts scaled noise
+    power from the entire signal.  Writes a denoised WAV to a temp file and
+    returns its path.  The caller is responsible for cleanup.
+
+    Returns (denoised_path, elapsed_seconds) or (original_path, 0) if
+    denoising is disabled or fails.
+    """
+    denoise_cfg = config.get("denoise", {})
+    if not denoise_cfg.get("enabled", True):
+        return audio_path, 0
+
+    import librosa
+    import soundfile as sf
+
+    factor = denoise_cfg.get("factor", 2.0)
+    profile_secs = denoise_cfg.get("noise_profile_seconds", 10)
+    sr = SAMPLE_RATE  # 16 kHz — what Whisper expects
+
+    try:
+        t0 = time.time()
+        audio, _ = librosa.load(audio_path, sr=sr)
+
+        noise_clip = audio[: sr * profile_secs]
+        n_fft, hop = 2048, 512
+
+        noise_stft = librosa.stft(noise_clip, n_fft=n_fft, hop_length=hop)
+        noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
+
+        audio_stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+        audio_power = np.abs(audio_stft) ** 2
+
+        clean_power = np.maximum(audio_power - factor * noise_power, 0.0)
+        gain = np.sqrt(clean_power / (audio_power + 1e-10))
+        clean_stft = audio_stft * gain
+
+        denoised = librosa.istft(clean_stft, hop_length=hop, length=len(audio))
+        denoised = denoised.astype(np.float32)
+
+        # Write to temp file next to the original
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix=".denoise_")
+        os.close(tmp_fd)
+        sf.write(tmp_path, denoised, sr)
+
+        elapsed = time.time() - t0
+        return tmp_path, elapsed
+
+    except Exception as e:
+        print(f"  ⚠  Denoising failed ({e}), using original audio")
+        return audio_path, 0
+
+
 # ─── MLX Engine Helpers ──────────────────────────────────────────────────────
 
 def _get_mlx_repo(model_name):
@@ -1939,13 +2026,55 @@ def _transcribe_mlx(audio_path, model_name, language="en", word_timestamps=True)
     """Transcribe audio using mlx-whisper (Apple Silicon GPU)."""
     import mlx_whisper
     repo = _get_mlx_repo(model_name)
+
+    # hallucination_silence_threshold skips silent segments where hallucination
+    # is detected. Requires word_timestamps=True to work.
+    hst = config.get("whisper", {}).get("hallucination_silence_threshold", 2.0)
+    if hst is not None:
+        word_timestamps = True  # Required for HST
+
     result = mlx_whisper.transcribe(
         audio_path,
         path_or_hf_repo=repo,
         word_timestamps=word_timestamps,
         language=language,
+        hallucination_silence_threshold=hst,
     )
     return result
+
+
+def _is_parakeet(model_name):
+    """Check if model_name refers to a Parakeet model."""
+    return model_name.startswith("parakeet")
+
+
+def _transcribe_parakeet(audio_path, model_name="parakeet"):
+    """Transcribe audio using Parakeet TDT (CTC model, Apple Silicon GPU).
+
+    Returns result in same format as _transcribe_mlx() for pipeline compatibility.
+    Parakeet doesn't hallucinate on silence (CTC architecture) and produces
+    properly punctuated, capitalized text.
+    """
+    from mlx_audio.stt import load as load_stt
+
+    repo = config.get("mlx_models", {}).get(model_name, "mlx-community/parakeet-tdt-0.6b-v3")
+    model = load_stt(repo)
+    result = model.generate(audio_path, chunk_duration=30.0, verbose=False)
+
+    # Convert Parakeet sentences to Whisper-compatible segments
+    segments = []
+    for i, sentence in enumerate(result.sentences):
+        segments.append({
+            "id": i,
+            "start": sentence.start,
+            "end": sentence.end,
+            "text": sentence.text,
+        })
+
+    del model
+    gc.collect()
+
+    return {"segments": segments, "language": "en", "text": result.text}
 
 
 def _transcribe_mlx_chunk(chunk, mlx_repo, language="en"):
@@ -1976,27 +2105,28 @@ def _diarize_mlx_audio(audio_path):
     Uses streaming mode to keep RAM usage low on 16GB machines.
     Max 4 speakers (architectural limit of Sortformer model).
     """
-    from mlx_audio.vad.models.sortformer.sortformer import Model
-    from mlx_audio.vad.models.sortformer.config import ModelConfig
-    from huggingface_hub import snapshot_download
+    from mlx_audio.vad import load as load_vad
     import mlx.core as mx
 
     diar_config = config["diarization"]
     model_id = diar_config.get("mlx_model", "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16")
     chunk_duration = diar_config.get("mlx_chunk_duration", 10.0)
+    threshold = diar_config.get("threshold", 0.5)
+    min_duration = diar_config.get("min_duration", 0.0)
+    merge_gap = diar_config.get("merge_gap", 0.0)
 
-    model_path = snapshot_download(model_id, token=HF_TOKEN)
-    with open(f"{model_path}/config.json") as f:
-        cfg = json.load(f)
-
-    model_config = ModelConfig.from_dict(cfg)
-    model = Model(model_config)
-    model.load_weights(f"{model_path}/model.safetensors", strict=False)
-    model.eval()
+    model = load_vad(model_id)
 
     # Streaming mode — processes in chunks, uses much less RAM
     turns = []
-    for chunk_result in model.generate_stream(audio_path, chunk_duration=chunk_duration, verbose=False):
+    for chunk_result in model.generate_stream(
+        audio_path,
+        chunk_duration=chunk_duration,
+        threshold=threshold,
+        min_duration=min_duration,
+        merge_gap=merge_gap,
+        verbose=False,
+    ):
         for seg in chunk_result.segments:
             turns.append({
                 "start": seg.start,
@@ -2097,6 +2227,7 @@ def cmd_run(args):
     speakers_str = getattr(args, "speakers", None)
     title = getattr(args, "title", None)
     no_diarize = getattr(args, "no_diarize", False)
+    no_denoise = getattr(args, "no_denoise", False)
     batch_size = config["batch_sizes"].get(model_name, 8)
     batch_size, ram_msg = adaptive_batch_size(batch_size, model_name)
     if ram_msg:
@@ -2131,24 +2262,31 @@ def cmd_run(args):
         else:
             estimated_time += audio_duration * 1.2  # pyannote is ~1.2x audio length on CPU
 
-    engine_label = "mlx (GPU)" if ENGINE == "mlx" else "whisperx (CPU)"
+    # Parakeet doesn't need denoising (CTC can't hallucinate on silence)
+    is_parakeet_model = _is_parakeet(model_name)
+    denoise_enabled = config.get("denoise", {}).get("enabled", True) and not no_denoise and not is_parakeet_model
+    denoise_factor = config.get("denoise", {}).get("factor", 2.0)
+
+    engine_label = "parakeet (GPU)" if is_parakeet_model else ("mlx (GPU)" if ENGINE == "mlx" else "whisperx (CPU)")
     model_size = MODEL_INFO.get(model_name, {}).get("size", "?")
     model_desc = MODEL_INFO.get(model_name, {}).get("description", "")
     diar_label = "off"
     if diarize_enabled:
         diar_label = f"{diar_engine} (GPU)" if diar_engine == "mlx-audio" else f"{diar_engine} (CPU)"
+    denoise_label = f"spectral sub {denoise_factor}x" if denoise_enabled else "off"
 
     # Determine pipeline steps for display
+    denoise_prefix = "Denoise → " if denoise_enabled else ""
     if ENGINE == "mlx":
         if diarize_enabled:
-            steps_preview = "Diarize → Transcribe → Save"
+            steps_preview = f"{denoise_prefix}Diarize → Transcribe → Save"
         else:
-            steps_preview = "Load model → Transcribe → Save"
+            steps_preview = f"{denoise_prefix}Load model → Transcribe → Save"
     else:
         if diarize_enabled:
-            steps_preview = "Load → Transcribe → Align → Diarize → Save"
+            steps_preview = f"{denoise_prefix}Load → Transcribe → Align → Diarize → Save"
         else:
-            steps_preview = "Load → Transcribe → Align → Save"
+            steps_preview = f"{denoise_prefix}Load → Transcribe → Align → Save"
 
     print()
     print("  ┌─────────────────────────────────────────────────┐")
@@ -2161,6 +2299,7 @@ def cmd_run(args):
     if ENGINE != "mlx":
         print(f"  │  Batch:    {batch_size:<38}│")
     print(f"  │  Language: {language:<38}│")
+    print(f"  │  Denoise:  {denoise_label:<38}│")
     print(f"  │  Diarize:  {diar_label:<38}│")
     print(f"  │  Pipeline: {steps_preview:<38}│")
     print(f"  │  Est time: ~{format_duration(estimated_time):<37}│")
@@ -2188,33 +2327,54 @@ def cmd_run(args):
     engine_key = "mlx" if use_mlx else "cpu"
     step_names, step_weights = PIPELINE_STEPS[(engine_key, bool(diarize_enabled))]
 
+    # Prepend denoising step if enabled
+    if denoise_enabled:
+        step_names = ["Denoising audio"] + step_names
+        # Denoising is fast (~2s) — give it a small weight
+        step_weights = [0.02] + [w * 0.98 for w in step_weights]
+
     progress = ProgressTracker(audio_duration, model_name)
     progress.step_names = step_names
     progress.step_weights = step_weights
     progress.start()
 
+    denoised_path = None  # Track temp file for cleanup
     result = None
     try:
+        step = 0
+
+        # ── Denoise ──
+        if denoise_enabled:
+            progress.set_step(step)
+            denoised_path, denoise_time = _denoise_audio(audio_path)
+            transcribe_path = denoised_path
+            step += 1
+        else:
+            transcribe_path = audio_path
+
         if use_mlx:
             import mlx.core as mx
             # ── MLX engine (Apple Silicon GPU) ──
             # Diarize FIRST with small Sortformer model (~100MB),
             # free GPU memory, THEN transcribe with large Whisper model.
             # Metal GPU crashes if two models run simultaneously.
-            step = 0
             speaker_turns = None
 
             if diarize_enabled:
                 progress.set_step(step)  # Identifying speakers
+                # Diarize on original audio (denoising can distort speaker embeddings)
                 speaker_turns = _diarize_standalone(audio_path)
                 gc.collect()
                 mx.clear_cache()  # Free Sortformer GPU memory before loading Whisper
                 step += 1
 
             progress.set_step(step)  # Transcribing
-            # Skip word_timestamps when diarizing — we only need segment-level
-            result = _transcribe_mlx(audio_path, model_name, language,
-                                     word_timestamps=not diarize_enabled)
+            if _is_parakeet(model_name):
+                result = _transcribe_parakeet(transcribe_path, model_name)
+            else:
+                # Skip word_timestamps when diarizing — we only need segment-level
+                result = _transcribe_mlx(transcribe_path, model_name, language,
+                                         word_timestamps=not diarize_enabled)
 
             if speaker_turns is not None:
                 result["segments"] = _assign_speakers_to_segments(
@@ -2226,7 +2386,6 @@ def cmd_run(args):
             # ── WhisperX engine (CPU) ──
             import whisperx
 
-            step = 0
             progress.set_step(step)  # Loading model
             model = whisperx.load_model(
                 model_name, DEVICE, compute_type=config["compute_type"], language=language
@@ -2234,7 +2393,7 @@ def cmd_run(args):
 
             step += 1
             progress.set_step(step)  # Transcribing
-            audio = whisperx.load_audio(audio_path)
+            audio = whisperx.load_audio(transcribe_path)
             result = model.transcribe(audio, batch_size=batch_size)
             detected_language = result.get("language", language)
             del model
@@ -2279,6 +2438,13 @@ def cmd_run(args):
                 print(f"  ✅ Partial transcription saved to: {cp_path}")
                 print(f"  💡 Re-run with --no-diarize to use the transcription without speakers.")
         return
+    finally:
+        # Clean up denoised temp file
+        if denoised_path and denoised_path != audio_path:
+            try:
+                os.unlink(denoised_path)
+            except OSError:
+                pass
 
     progress.stop()
 
@@ -3353,6 +3519,7 @@ Examples:
     run_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     run_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
     run_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
+    run_parser.add_argument("--no-denoise", action="store_true", help="Skip audio denoising")
 
     # live
     live_parser = subparsers.add_parser("live", help="Record + transcribe simultaneously")

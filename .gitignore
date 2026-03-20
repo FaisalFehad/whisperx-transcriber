@@ -15,6 +15,12 @@ recordings/
 .checkpoints/
 history.jsonl
 
+# Test artifacts
+denoise_test/
+
+# Temp denoised audio files
+.denoise_*.wav
+
 # Logs
 *.log
 watch-stdout.log

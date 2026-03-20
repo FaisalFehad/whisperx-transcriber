@@ -4,8 +4,8 @@
 
     "_comment_engine": "Engine: 'mlx' = Apple Silicon GPU (~7x faster), 'whisperx' = CPU (compatible)",
     "engine": "mlx",
-    "_comment_model": "Use .en variants for English (more accurate): small.en, medium.en, etc.",
-    "default_model": "small.en",
+    "_comment_model": "parakeet = best accuracy, no hallucinations. Or Whisper: small.en, medium.en, turbo, etc.",
+    "default_model": "parakeet",
     "_comment_language": "Supported languages: https://github.com/openai/whisper#available-models-and-languages",
     "language": "en",
     "_comment_compute": "compute_type and device are only used by the whisperx engine",
@@ -40,13 +40,31 @@
         "mic_low_warning_seconds": 10
     },
 
+    "whisper": {
+        "_comment": "Only used when default_model is a Whisper model (not parakeet).",
+        "_comment2": "Skips silent segments where hallucination is detected. Set to null to disable.",
+        "hallucination_silence_threshold": 2.0
+    },
+
+    "denoise": {
+        "_comment": "Spectral subtraction — only used with Whisper models. Parakeet skips this automatically.",
+        "_comment2": "Reduces background noise using first N seconds as noise profile.",
+        "enabled": true,
+        "factor": 2.0,
+        "noise_profile_seconds": 10
+    },
+
     "diarization": {
         "enabled": true,
         "_comment_engine": "mlx-audio = fast Apple GPU (max 4 speakers), pyannote = slow CPU (unlimited speakers)",
         "engine": "mlx-audio",
         "model": "pyannote/speaker-diarization-3.1",
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
-        "mlx_chunk_duration": 10.0
+        "mlx_chunk_duration": 10.0,
+        "_comment_tuning": "threshold (0-1): speaker detection sensitivity. min_duration: ignore segments shorter than this. merge_gap: merge same-speaker segments closer than this.",
+        "threshold": 0.5,
+        "min_duration": 0.0,
+        "merge_gap": 0.0
     },
 
     "live": {

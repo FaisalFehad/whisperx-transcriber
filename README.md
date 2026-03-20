@@ -2,7 +2,7 @@
 
 Record recordings (in-person or Zoom/Teams), transcribe with speaker diarization, and save as Markdown to your Obsidian vault.
 
-Built on [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon GPU) and [WhisperX](https://github.com/m-bain/whisperX) (CPU fallback) with [pyannote](https://github.com/pyannote/pyannote-audio) speaker diarization. Runs locally on Apple Silicon — no cloud APIs needed.
+Built on [Parakeet TDT](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) (NVIDIA NeMo, CTC) for transcription and [Sortformer](https://huggingface.co/mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16) for speaker diarization — both running on Apple Silicon GPU via [MLX](https://github.com/ml-explore/mlx). Falls back to [WhisperX](https://github.com/m-bain/whisperX) (CPU) if needed. Runs entirely locally — no cloud APIs.
 
 ## Features
 
@@ -11,7 +11,7 @@ Built on [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whis
 - **Live mode** — transcribe during the call so results are ready when you hang up
 - **Speaker memory** — enroll your voice once, get auto-recognized in every transcript
 - **Calendar watch** — auto-record meetings from macOS Calendar (runs as background daemon)
-- **MLX GPU acceleration** — ~7x faster than CPU on Apple Silicon (M1/M2/M3/M4)
+- **MLX GPU acceleration** — runs on Apple Silicon GPU (M1/M2/M3/M4)
 - **Adaptive scaling** — live mode auto-adjusts chunk size based on CPU load
 - **Silence detection** — auto-stop recording when the meeting ends
 - **Obsidian-ready** — saves Markdown with YAML frontmatter, timestamps, and speaker labels
@@ -104,11 +104,12 @@ That's it — the transcript is saved as Markdown to your Obsidian vault.
 
 | Flag | Example | What it does |
 |------|---------|-------------|
-| `-m` | `-m medium` | Use a different model (default: small) |
+| `-m` | `-m turbo` | Use a different model (default: parakeet) |
 | `-t` | `-t "Team Meeting"` | Set the transcript title |
 | `-s` | `-s "Alice,Bob"` | Name the speakers |
 | `-l` | `-l ar` | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
 | `--no-diarize` | | Skip speaker identification (faster) |
+| `--no-denoise` | | Skip audio denoising (Whisper only) |
 
 **Examples:**
 
@@ -176,20 +177,51 @@ You can filter which calendars to watch in `config.json`.
 
 ## Models
 
-| Model | Speed | Accuracy | RAM | Size |
-|-------|-------|----------|-----|------|
-| tiny / tiny.en | Fastest | Low | ~1GB | ~75MB |
-| base / base.en | Fast | Good | ~1.5GB | ~140MB |
-| **small / small.en** | **Balanced** | **Recommended** | **~3GB** | **~460MB** |
-| medium / medium.en | Slow | High | ~5GB | ~1.5GB |
-| **turbo** | **Fast** | **Near-best** | **~6GB** | **~1.6GB** |
-| large-v3 | Slowest | Highest | ~10GB | ~3GB |
+The default model is **Parakeet TDT 0.6B** — a CTC-based model from NVIDIA NeMo that produces properly punctuated, capitalized text without hallucinations. Whisper models are available as alternatives.
 
-**`.en` models** are English-only — more accurate for English since they don't split capacity across 99 languages. Use `small.en` (default) for English, `small` for other languages.
+| Model | Type | Speed | Size | Notes |
+|-------|------|-------|------|-------|
+| **parakeet** | **CTC** | **~17x RT** | **~2.5GB** | **Default — best accuracy, no hallucinations** |
+| small.en | Whisper | ~16x RT | ~460MB | Low RAM alternative |
+| turbo | Whisper | ~12x RT | ~1.6GB | Good for technical jargon |
+| medium.en | Whisper | ~8x RT | ~1.5GB | Higher accuracy Whisper |
+| large-v3 | Whisper | ~4x RT | ~3GB | Highest accuracy Whisper |
 
-`turbo` is a distilled version of `large-v3` — nearly the same accuracy but ~8x faster. Best choice if you have 16GB+ RAM.
+Speed measured on M1 16GB with MLX (GPU). RT = realtime (17x RT means a 1-hour file transcribes in ~3.5 min).
 
-Speed depends on your hardware and engine. With `mlx` (default), models run on Apple GPU — roughly 7x faster than the `whisperx` CPU engine. On M1 16GB with mlx, `small` processes about 14x faster than realtime.
+### Why Parakeet over Whisper?
+
+Parakeet uses a CTC (Connectionist Temporal Classification) architecture that maps audio frames directly to text. Unlike Whisper's autoregressive decoder, CTC **cannot hallucinate** — it has no feedback loop to generate runaway tokens like "Thank Thank Thank..." or "..." during silence.
+
+### Accuracy
+
+Evaluated on a 37-minute session recording (4 speakers, background noise, ~60s silence at start). Scored independently by two human evaluators listening to the reference audio. All times measured on M1 16GB.
+
+| Rank | Score /10 | Model | Speed | Hallucinations | Stability | Notes |
+|------|-----------|-------|-------|----------------|-----------|-------|
+| 1 | **9.5** | **Parakeet + diarize** | **129s (~17x RT)** | **None** | **Stable** | Best fidelity, proper punctuation and caps |
+| 2 | 9.0 | Parakeet, no diarize | 129s (~17x RT) | None | Stable | Same text quality, no speaker labels |
+| 3 | 7.5 | Whisper medium | ~275s (~8x RT) | Moderate | OK | Lexical substitutions ("flip-flops", "CHI") |
+| 4 | 6.5 | Whisper + denoising | ~170s (~13x RT) | Some at start | OK | "DAVID" hallucinations in opening silence |
+| 5 | 6.0 | Whisper large-v3.en | ~550s (~4x RT) | Low | Unstable | Skipped first 6.5 min entirely |
+| 6 | 5.5 | Whisper turbo | ~180s (~12x RT) | Severe at start | Unstable | First minutes corrupted by looping tokens |
+| 7 | 4.5 | Whisper small | ~140s (~16x RT) | Severe | Unstable | Got stuck in hallucination loop on raw audio |
+
+**Key columns explained:**
+- **Speed** — Wall-clock time for the 37-min file (transcription only, excludes diarization). RT = realtime.
+- **Hallucinations** — Whisper generates fake text ("Thank Thank Thank...", "...", "DAVID") during silence. Parakeet's CTC architecture makes this impossible.
+- **Stability** — Whether the model reliably finishes. Whisper turbo/small can enter infinite hallucination loops on noisy audio and never complete. Parakeet always finishes.
+
+**When to choose what:**
+
+| Use case | Model | Why |
+|----------|-------|-----|
+| **General use** | `parakeet` (default) | Best accuracy, no hallucinations, stable |
+| **Low RAM (< 8GB free)** | `small.en` | Only 460MB vs 2.5GB, needs `--no-denoise` off |
+| **Non-English** | `small` or `turbo` | Parakeet is English-only |
+| **Technical jargon** | `turbo` | Larger Whisper vocabulary, but needs denoising |
+
+When using Whisper models, `hallucination_silence_threshold` (HST) is enabled by default to skip hallucinated segments during silence. Spectral subtraction denoising is also applied automatically (disable with `--no-denoise`).
 
 ## Output
 
@@ -237,7 +269,7 @@ Any value you omit uses the built-in default. Here's what's available:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `engine` | `"mlx"` | `"mlx"` (Apple GPU, fast) or `"whisperx"` (CPU, compatible) |
-| `default_model` | `"small.en"` | Whisper model to use |
+| `default_model` | `"parakeet"` | Transcription model (`"parakeet"` or Whisper variants) |
 | `language` | `"en"` | Language code — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
 | `compute_type` | `"int8"` | Quantization — whisperx engine only |
 | `device` | `"cpu"` | Processing device — whisperx engine only |
@@ -328,6 +360,8 @@ To fully remove, delete the project folder afterward.
 
 ## Acknowledgements
 
+- [Parakeet TDT](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/models.html#parakeet-tdt) — CTC speech recognition from NVIDIA NeMo
+- [mlx-audio](https://github.com/Blaizzy/mlx-audio) — MLX bindings for Parakeet, Sortformer, and Whisper on Apple Silicon
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper on Apple Silicon GPU via MLX
 - [WhisperX](https://github.com/m-bain/whisperX) — fast Whisper with word-level timestamps (CPU fallback)
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) — speaker diarization and voice embeddings
