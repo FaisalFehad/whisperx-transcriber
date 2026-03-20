@@ -12,6 +12,8 @@ build/
 config.json
 speakers/
 recordings/
+.checkpoints/
+history.jsonl
 
 # Logs
 *.log
