@@ -2,7 +2,7 @@
 
 Record interviews (in-person or Zoom/Teams), transcribe with speaker diarization, and save as Markdown to your Obsidian vault.
 
-Built on [WhisperX](https://github.com/m-bain/whisperX) (OpenAI Whisper + pyannote speaker diarization). Runs locally on Apple Silicon — no cloud APIs needed.
+Built on [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon GPU) and [WhisperX](https://github.com/m-bain/whisperX) (CPU fallback) with [pyannote](https://github.com/pyannote/pyannote-audio) speaker diarization. Runs locally on Apple Silicon — no cloud APIs needed.
 
 ## Features
 
@@ -11,6 +11,7 @@ Built on [WhisperX](https://github.com/m-bain/whisperX) (OpenAI Whisper + pyanno
 - **Live mode** — transcribe during the call so results are ready when you hang up
 - **Speaker memory** — enroll your voice once, get auto-recognized in every transcript
 - **Calendar watch** — auto-record meetings from macOS Calendar (runs as background daemon)
+- **MLX GPU acceleration** — ~7x faster than CPU on Apple Silicon (M1/M2/M3/M4)
 - **Adaptive scaling** — live mode auto-adjusts chunk size based on CPU load
 - **Silence detection** — auto-stop recording when the meeting ends
 - **Obsidian-ready** — saves Markdown with YAML frontmatter, timestamps, and speaker labels
@@ -188,7 +189,7 @@ You can filter which calendars to watch in `config.json`.
 
 `turbo` is a distilled version of `large-v3` — nearly the same accuracy but ~8x faster. Best choice if you have 16GB+ RAM.
 
-Speed depends on your hardware. On M1 16GB, `small` processes about 2x faster than realtime.
+Speed depends on your hardware and engine. With `mlx` (default), models run on Apple GPU — roughly 7x faster than the `whisperx` CPU engine. On M1 16GB with mlx, `small` processes about 14x faster than realtime.
 
 ## Output
 
@@ -235,10 +236,11 @@ Any value you omit uses the built-in default. Here's what's available:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `default_model` | `"small"` | Whisper model to use |
-| `language` | `"en"` | Language code |
-| `compute_type` | `"int8"` | Quantization (int8 recommended for CPU) |
-| `device` | `"cpu"` | Processing device |
+| `engine` | `"mlx"` | `"mlx"` (Apple GPU, fast) or `"whisperx"` (CPU, compatible) |
+| `default_model` | `"small.en"` | Whisper model to use |
+| `language` | `"en"` | Language code — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
+| `compute_type` | `"int8"` | Quantization — whisperx engine only |
+| `device` | `"cpu"` | Processing device — whisperx engine only |
 | `user_name` | `""` | Your name for voice recognition |
 
 ### Paths
@@ -326,6 +328,7 @@ To fully remove, delete the project folder afterward.
 
 ## Acknowledgements
 
-- [WhisperX](https://github.com/m-bain/whisperX) — fast Whisper with word-level timestamps
+- [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper on Apple Silicon GPU via MLX
+- [WhisperX](https://github.com/m-bain/whisperX) — fast Whisper with word-level timestamps (CPU fallback)
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) — speaker diarization and voice embeddings
 - [BlackHole](https://github.com/ExistentialAudio/BlackHole) — virtual audio driver for macOS

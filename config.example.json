@@ -2,10 +2,13 @@
     "_comment": "Copy this file to config.json and change only what you need.",
     "_comment2": "Any value you omit will use the built-in default.",
 
+    "_comment_engine": "Engine: 'mlx' = Apple Silicon GPU (~7x faster), 'whisperx' = CPU (compatible)",
+    "engine": "mlx",
     "_comment_model": "Use .en variants for English (more accurate): small.en, medium.en, etc.",
     "default_model": "small.en",
     "_comment_language": "Supported languages: https://github.com/openai/whisper#available-models-and-languages",
     "language": "en",
+    "_comment_compute": "compute_type and device are only used by the whisperx engine",
     "compute_type": "int8",
     "device": "cpu",
 
@@ -18,7 +21,8 @@
         "small.en": 16,
         "medium.en": 8,
         "turbo": 4,
-        "large-v3": 4
+        "large-v3": 4,
+        "large-v3.en": 4
     },
 
     "paths": {
@@ -38,7 +42,11 @@
 
     "diarization": {
         "enabled": true,
-        "model": "pyannote/speaker-diarization-3.1"
+        "_comment_engine": "mlx-audio = fast Apple GPU (max 4 speakers), pyannote = slow CPU (unlimited speakers)",
+        "engine": "mlx-audio",
+        "model": "pyannote/speaker-diarization-3.1",
+        "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
+        "mlx_chunk_duration": 10.0
     },
 
     "live": {
@@ -68,7 +76,9 @@
         "model": "small",
         "calendars": [],
         "end_buffer_minutes": 2,
-        "refresh_hours": 3
+        "refresh_hours": 3,
+        "_comment_record_only": "true = record during meeting, transcribe after. false = live transcribe during meeting.",
+        "record_only": true
     },
 
     "_comment_formats": "Supported audio formats: MP3, WAV, M4A, OGG, FLAC, WebM",
