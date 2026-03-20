@@ -101,6 +101,9 @@ DEFAULT_CONFIG = {
 
     # ── Live mode (record + transcribe simultaneously) ───────────────────
     "live": {
+        # Model for live mode — use a lighter model for real-time processing
+        # The heavier default_model is used for post-recording transcription (cmd_run)
+        "model": "small.en",
         # Seconds between transcription chunks during recording
         # Lower = more real-time but more CPU. Recommended: 120
         "chunk_interval_seconds": 120,
@@ -253,6 +256,46 @@ def level_meter(rms, width=20):
 def spinner_char(tick):
     chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     return chars[tick % len(chars)]
+
+
+def get_available_ram_gb():
+    """Get available RAM in GB (macOS)."""
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        total = int(result.stdout.strip()) / (1024 ** 3)
+        # Use vm_stat to estimate free memory
+        vm = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=5
+        )
+        free_pages = 0
+        for line in vm.stdout.splitlines():
+            if "free" in line.lower() or "inactive" in line.lower():
+                nums = re.findall(r"(\d+)", line)
+                if nums:
+                    free_pages += int(nums[-1])
+        # Each page is 16KB on Apple Silicon
+        available = (free_pages * 16384) / (1024 ** 3)
+        return available
+    except Exception:
+        return -1  # unknown
+
+
+def adaptive_batch_size(batch_size, model_name):
+    """Scale batch_size based on available RAM. Returns (adjusted_size, message)."""
+    available = get_available_ram_gb()
+    if available < 0:
+        return batch_size, None  # can't determine, use default
+
+    if available < 2:
+        adjusted = max(1, batch_size // 4)
+        return adjusted, f"⚠ Low RAM ({available:.1f}GB free) — batch_size {batch_size}→{adjusted}"
+    elif available < 4:
+        adjusted = max(2, batch_size // 2)
+        return adjusted, f"⚠ Limited RAM ({available:.1f}GB free) — batch_size {batch_size}→{adjusted}"
+    else:
+        return batch_size, None  # plenty of RAM
 
 
 def quality_label(rms):
@@ -834,7 +877,7 @@ def cmd_live(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model_name = args.model or config["default_model"]
+    model_name = args.model or config["live"].get("model", config["default_model"])
     language = args.language or config["language"]
     batch_size = config["batch_sizes"].get(model_name, 8)
     chunk_interval = config["live"]["chunk_interval_seconds"]
@@ -1377,6 +1420,9 @@ def cmd_run(args):
     title = getattr(args, "title", None)
     no_diarize = getattr(args, "no_diarize", False)
     batch_size = config["batch_sizes"].get(model_name, 8)
+    batch_size, ram_msg = adaptive_batch_size(batch_size, model_name)
+    if ram_msg:
+        print(f"  {ram_msg}")
 
     if not title:
         title = Path(audio_path).stem.replace("_", " ").replace("-", " ").title()
@@ -1402,6 +1448,7 @@ def cmd_run(args):
     print(f"  │  File:     {Path(audio_path).name:<38}│")
     print(f"  │  Duration: {format_duration(audio_duration):<38}│")
     print(f"  │  Model:    {model_name:<38}│")
+    print(f"  │  Batch:    {batch_size:<38}│")
     print(f"  │  Language: {language:<38}│")
     print(f"  │  Est time: ~{format_duration(estimated_time):<37}│")
     print(f"  │  Started:  {datetime.now().strftime('%H:%M:%S'):<38}│")

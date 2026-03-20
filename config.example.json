@@ -43,6 +43,8 @@
 
     "live": {
         "_comment": "Adaptive scaling auto-adjusts chunk_interval and batch_size during recording.",
+        "_comment_model": "Live uses a lighter model for real-time. Post-recording uses default_model.",
+        "model": "small.en",
         "chunk_interval_seconds": 120,
         "min_chunk_interval": 60,
         "max_chunk_interval": 300,
