@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local Transcriber — Record, transcribe, and save to Obsidian.
+Transcriber — Record, transcribe, and save as Markdown.
 
 Commands:
     transcribe rec                  Start recording (auto-stops on silence)
@@ -75,7 +75,7 @@ DEFAULT_CONFIG = {
 
     # ── File paths ───────────────────────────────────────────────────────
     "paths": {
-        # Root folder in Obsidian vault for all session data
+        # Root folder for recordings and transcripts
         "obsidian_base": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Sessions",
         # Subfolders under obsidian_base (created automatically)
         "recordings_subdir": "Recordings",
@@ -326,7 +326,7 @@ def _unique_path(path):
     """Return path if it doesn't exist, otherwise append (2), (3), etc.
     Also ensures filename doesn't exceed macOS's 255-byte limit.
 
-    Example: "2026-03-20 Session.md" → "2026-03-20 Session (2).md"
+    Example: "2026-03-20 Meeting.md" → "2026-03-20 Meeting (2).md"
     """
     path = Path(path)
     stem = _safe_filename(path.stem, path.suffix)
@@ -1111,7 +1111,7 @@ def cmd_record(args):
 
     print()
     print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  🎙  Session Recorder                          │")
+    print("  │  🎙  Audio Recorder                                │")
     print("  │  Press Ctrl+C to stop recording                  │")
     print(f"  │  Auto-stops after {SILENCE_TIMEOUT // 60}min of silence                  │")
     print(f"  │  Source: {source_label:<38}│")
@@ -2645,7 +2645,7 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
     lines.append("---")
     lines.append(f"title: \"{title}\"")
     lines.append(f"date: {date_str}")
-    lines.append("type: session-transcript")
+    lines.append("type: transcript")
     speaker_list = ", ".join(speaker_names.values())
     lines.append(f"speakers: [{speaker_list}]")
     if meta.get("model"):
@@ -3495,13 +3495,13 @@ def cmd_watch_status(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Local Transcriber — Record, transcribe, save to Obsidian",
+        description="Transcriber — Record, transcribe, and save as Markdown",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     transcribe rec                              Record audio
     transcribe run                              Transcribe last recording
-    transcribe run ~/Downloads/audio.mp3    Transcribe a specific file
+    transcribe run ~/Downloads/recording.mp3    Transcribe a specific file
     transcribe live                             Record + transcribe simultaneously
     transcribe list                             List & manage recordings
         """,
