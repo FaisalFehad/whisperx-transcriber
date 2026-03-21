@@ -31,6 +31,13 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from system_audio import SystemAudioCapture as _SystemAudioCapture, is_available as _sck_is_available
+    _SCK_AVAILABLE = _sck_is_available()
+except ImportError:
+    _SystemAudioCapture = None
+    _SCK_AVAILABLE = False
+
 # Suppress torchcodec/pyannote/torchaudio deprecation warnings
 warnings.filterwarnings("ignore", message=".*torchcodec.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
@@ -292,6 +299,7 @@ SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 
 AUDIO_FORMATS = tuple(config["audio_formats"])
 BLACKHOLE_DEVICE_NAME = config["recording"]["blackhole_device"]
+VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 DEVICE = config.get("device", "cpu")
 ENGINE = config.get("engine", "mlx")
@@ -991,19 +999,31 @@ class LivePanel:
 # ─── Audio Device Detection ───────────────────────────────────────────────────
 
 def get_default_mic():
-    """Get the current default input device (mic, earphones, etc.)."""
+    """Get the best available real input device, preferring AirPods over MacBook mic."""
     import sounddevice as sd
+
+    # Pass 1 — trust the system default if it's a real (non-virtual) device
     default_idx = sd.default.device[0]
     if default_idx is not None and default_idx >= 0:
         try:
             info = sd.query_devices(default_idx)
-            return default_idx, info.get("name", "Unknown")
+            name = info.get("name", "")
+            if not any(v in name for v in VIRTUAL_DEVICE_NAMES):
+                return default_idx, name
         except Exception:
             pass
+
+    # Pass 2 — system default is virtual or unset; find best real mic
+    # Priority 1: Bluetooth/AirPods; Priority 2: any other real input
+    airpods_result = None
+    fallback_result = None
     for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and BLACKHOLE_DEVICE_NAME not in d["name"]:
-            return i, d["name"]
-    return None, "Unknown"
+        if d["max_input_channels"] > 0 and not any(v in d["name"] for v in VIRTUAL_DEVICE_NAMES):
+            if airpods_result is None and any(k in d["name"] for k in ("AirPods", "Bluetooth", "Wireless", "Pro")):
+                airpods_result = (i, d["name"])
+            elif fallback_result is None:
+                fallback_result = (i, d["name"])
+    return airpods_result or fallback_result or (None, "Unknown")
 
 
 def find_blackhole():
@@ -1035,11 +1055,89 @@ def find_audio_device():
                     break
         return bh_id, mic_id, mic_name
 
-    print("  ⚠  BlackHole not installed — recording from mic only.")
-    print("     Zoom/Teams audio won't be captured.")
-    print("     Install with: brew install blackhole-2ch && reboot")
-    print()
+    if not _SCK_AVAILABLE:
+        print("  ⚠  BlackHole not installed — recording from mic only.")
+        print("     Zoom/Teams audio won't be captured.")
+        print("     Install with: brew install blackhole-2ch && reboot")
+        print()
     return None, mic_id, mic_name
+
+
+# ─── Audio Routing & Volume ──────────────────────────────────────────────────
+
+def find_multi_output_device():
+    """Find a Multi-Output Device in the output device list (for BlackHole routing)."""
+    import sounddevice as sd
+    for d in sd.query_devices():
+        if d["max_output_channels"] > 0 and "Multi-Output" in d["name"]:
+            return d["name"]
+    return None
+
+
+def get_current_output_device():
+    """Get current system audio output device name via SwitchAudioSource."""
+    result = subprocess.run(
+        ["SwitchAudioSource", "-c", "-t", "output"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def set_output_device(device_name):
+    """Set system audio output device by name via SwitchAudioSource."""
+    subprocess.run(
+        ["SwitchAudioSource", "-s", device_name, "-t", "output"],
+        capture_output=True, check=True,
+    )
+
+
+def get_system_volume():
+    """Get current system output volume (0–100)."""
+    result = subprocess.run(
+        ["osascript", "-e", "get volume settings"],
+        capture_output=True, text=True, check=True,
+    )
+    parts = result.stdout.strip().split(",")[0]
+    return int(parts.split(":")[1].strip())
+
+
+def set_system_volume(percent):
+    """Set system output volume (0–100). Works even when Multi-Output Device is active."""
+    percent = max(0, min(100, int(percent)))
+    subprocess.run(
+        ["osascript", "-e", f"set volume output volume {percent}"],
+        check=True,
+    )
+
+
+def _route_to_multi_output():
+    """Switch system output to Multi-Output Device for BlackHole capture.
+
+    Returns the previous device name so it can be restored, or None if no
+    switch was made (already on Multi-Output, or SwitchAudioSource not installed).
+    """
+    target = find_multi_output_device()
+    if not target:
+        return None
+    try:
+        current = get_current_output_device()
+        if current and current != target:
+            set_output_device(target)
+            return current
+    except FileNotFoundError:
+        pass  # SwitchAudioSource not installed — silent skip
+    except Exception:
+        pass
+    return None
+
+
+def _restore_output(previous):
+    """Restore system output to a previously saved device name. No-op if None."""
+    if previous:
+        try:
+            set_output_device(previous)
+        except Exception:
+            pass
 
 
 def cmd_setup(args):
@@ -1102,8 +1200,8 @@ def cmd_record(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    bh_id, mic_id, mic_name = find_audio_device()
-    dual_mode = bh_id is not None
+    _, mic_id, mic_name = find_audio_device()
+    dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1161,18 +1259,19 @@ def cmd_record(args):
         samplerate=SAMPLE_RATE, channels=1, dtype="float32",
         device=mic_id, blocksize=blocksize, callback=mic_callback,
     )
-    bh_stream = None
-    if dual_mode:
-        bh_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=2, dtype="float32",
-            device=bh_id, blocksize=blocksize, callback=bh_callback,
-        )
+    sck_capture = None
+    if _SystemAudioCapture is not None:
+        try:
+            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=bh_callback)
+        except RuntimeError as e:
+            print(f"  ⚠  System audio unavailable: {e}")
+            dual_mode = False
 
     auto_stopped = False
     try:
         mic_stream.start()
-        if bh_stream:
-            bh_stream.start()
+        if sck_capture:
+            sck_capture.start()
         mic_low_since_rec = None
         while recording:
             # Fix #4: read shared state under lock
@@ -1220,9 +1319,8 @@ def cmd_record(args):
     finally:
         mic_stream.stop()
         mic_stream.close()
-        if bh_stream:
-            bh_stream.stop()
-            bh_stream.close()
+        if sck_capture:
+            sck_capture.stop()
 
     clear_line()
     elapsed = time.time() - start_time
@@ -1366,8 +1464,8 @@ def cmd_live(args):
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
-    bh_id, mic_id, mic_name = find_audio_device()
-    dual_mode = bh_id is not None
+    _, mic_id, mic_name = find_audio_device()
+    dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1564,12 +1662,13 @@ def cmd_live(args):
         samplerate=SAMPLE_RATE, channels=1, dtype="float32",
         device=mic_id, blocksize=blocksize, callback=mic_callback,
     )
-    bh_stream = None
-    if dual_mode:
-        bh_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=2, dtype="float32",
-            device=bh_id, blocksize=blocksize, callback=bh_callback,
-        )
+    sck_capture = None
+    if _SystemAudioCapture is not None:
+        try:
+            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=bh_callback)
+        except RuntimeError as e:
+            print(f"  ⚠  System audio unavailable: {e}")
+            dual_mode = False
 
     transcription_thread = threading.Thread(target=transcription_worker, daemon=True)
     auto_stopped = False
@@ -1577,8 +1676,8 @@ def cmd_live(args):
 
     try:
         mic_stream.start()
-        if bh_stream:
-            bh_stream.start()
+        if sck_capture:
+            sck_capture.start()
         transcription_thread.start()
 
         while recording:
@@ -1652,9 +1751,8 @@ def cmd_live(args):
     finally:
         mic_stream.stop()
         mic_stream.close()
-        if bh_stream:
-            bh_stream.stop()
-            bh_stream.close()
+        if sck_capture:
+            sck_capture.stop()
 
     clear_line()
     recording_end = time.time()
