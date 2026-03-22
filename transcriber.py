@@ -12,6 +12,9 @@ Commands:
     transcribe setup                Audio device setup guide
 """
 
+import os
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"  # suppress tqdm "Fetching N files" bars
+
 import argparse
 import gc
 import json
@@ -1147,19 +1150,13 @@ def cmd_setup(args):
     bh_id, _ = find_blackhole()
     mic_id, mic_name = get_default_mic()
 
+    from ui import info_panel
+    bh_status = "✅ System audio capture" if bh_id is not None else "❌ Not installed (brew install blackhole-2ch)"
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  🔧 Audio Setup                                 │")
-    print("  ├─────────────────────────────────────────────────┤")
-
-    if bh_id is not None:
-        print("  │  ✅ BlackHole 2ch — system audio capture       │")
-    else:
-        print("  │  ❌ BlackHole 2ch — not installed               │")
-        print("  │     brew install blackhole-2ch && reboot        │")
-
-    print(f"  │  🎙  Mic: {mic_name:<38}│")
-    print("  └─────────────────────────────────────────────────┘")
+    info_panel("🔧 Audio Setup", [
+        ("BlackHole:", bh_status),
+        ("Mic:", mic_name),
+    ])
 
     if bh_id is not None:
         print()
@@ -1207,13 +1204,13 @@ def cmd_record(args):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_path = RECORDINGS_DIR / f"{timestamp}.wav"
 
+    from ui import info_panel
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  🎙  Audio Recorder                                │")
-    print("  │  Press Ctrl+C to stop recording                  │")
-    print(f"  │  Auto-stops after {SILENCE_TIMEOUT // 60}min of silence                  │")
-    print(f"  │  Source: {source_label:<38}│")
-    print("  └─────────────────────────────────────────────────┘")
+    info_panel("🎙 Recording", [
+        ("Source:", source_label),
+        ("Silence:", f"Auto-stops after {SILENCE_TIMEOUT // 60}min"),
+        ("Controls:", "Ctrl+C to stop"),
+    ])
     print()
 
     mic_frames = []
@@ -1267,50 +1264,36 @@ def cmd_record(args):
             print(f"  ⚠  System audio unavailable: {e}")
             dual_mode = False
 
+    from ui import RecordingDisplay
+
     auto_stopped = False
+    display = RecordingDisplay()
     try:
         mic_stream.start()
         if sck_capture:
             sck_capture.start()
         mic_low_since_rec = None
-        while recording:
-            # Fix #4: read shared state under lock
-            with lock:
-                rms = current_rms
-                sil = silence_start
+        with display:
+            while recording:
+                with lock:
+                    rms = current_rms
+                    sil = silence_start
 
-            elapsed = time.time() - start_time
-            silence_elapsed = time.time() - sil if sil else 0
-            meter = level_meter(rms)
+                elapsed = time.time() - start_time
+                silence_elapsed = time.time() - sil if sil else 0
 
-            # Quality indicator
-            if rms > 0.01:
-                q = "🟢"
-            elif rms > 0.003:
-                q = "🟡"
-            else:
-                q = "🔴"
+                # Mic low warning
+                if rms < 0.001:
+                    if mic_low_since_rec is None:
+                        mic_low_since_rec = time.time()
+                    elif time.time() - mic_low_since_rec > MIC_LOW_WARNING_SECONDS:
+                        display.set_warning("Mic very low!")
+                else:
+                    mic_low_since_rec = None
+                    display.set_warning(None)
 
-            # Mic low warning
-            mic_warn = ""
-            if rms < 0.001:
-                if mic_low_since_rec is None:
-                    mic_low_since_rec = time.time()
-                elif time.time() - mic_low_since_rec > MIC_LOW_WARNING_SECONDS:
-                    mic_warn = " ⚠ Mic very low!"
-            else:
-                mic_low_since_rec = None
-
-            status_line = (
-                f"  ⏺  {format_duration(elapsed)} │ "
-                f"{meter} {q} │ "
-                f"Silence: {format_duration(silence_elapsed)}/{format_duration(SILENCE_TIMEOUT)}"
-                f"{mic_warn}"
-            )
-            clear_line()
-            sys.stdout.write(status_line)
-            sys.stdout.flush()
-            time.sleep(0.3)
+                display.update(rms, elapsed, silence_elapsed)
+                time.sleep(0.25)
 
         auto_stopped = True
 
@@ -1321,8 +1304,6 @@ def cmd_record(args):
         mic_stream.close()
         if sck_capture:
             sck_capture.stop()
-
-    clear_line()
     elapsed = time.time() - start_time
 
     if not mic_frames:
@@ -1334,15 +1315,16 @@ def cmd_record(args):
     if saved_to:
         output_path = saved_to
 
+    from ui import success_panel
+    stop_reason = f"Auto-stopped after {SILENCE_TIMEOUT // 60}min silence" if auto_stopped else "Recording stopped"
+    file_size_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
     print()
-    if auto_stopped:
-        print(f"  ⏹  Auto-stopped after {SILENCE_TIMEOUT // 60}min of silence")
-    else:
-        print(f"  ⏹  Recording stopped")
-
-    print(f"  📁 Saved: {output_path.name}")
-    print(f"  ⏱  Duration: {format_duration(elapsed)}")
-    print(f"  📂 Location: {output_path.parent}")
+    success_panel(f"⏹ {stop_reason}", [
+        ("File:", output_path.name),
+        ("Duration:", format_duration(elapsed)),
+        ("Size:", f"{file_size_mb:.1f} MB"),
+        ("Location:", str(output_path.parent)),
+    ])
     print()
 
     prompt_transcribe(str(output_path))
@@ -1372,7 +1354,7 @@ def prompt_transcribe(audio_path):
 
     if answer in ("", "y", "yes"):
         model = prompt_model_selection()
-        speakers = input("  Speaker names (comma-separated, or Enter to skip): ").strip()
+        speakers = input("  Speaker names [optional, comma-separated — Enter to skip]: ").strip()
         title = input("  Title (or Enter for auto): ").strip()
 
         run_args = argparse.Namespace(
@@ -1395,16 +1377,20 @@ def prompt_model_selection():
     default_model = config["default_model"]
     default_idx = models.index(default_model) + 1 if default_model in models else 3
 
-    print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  Choose transcription model:                    │")
-    print("  ├─────────────────────────────────────────────────┤")
+    from ui import console
+    from rich.table import Table
+    from rich.panel import Panel
+
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("num", style="dim", width=3)
+    table.add_column("name", style="bold", width=11)
+    table.add_column("desc")
+    table.add_column("star", width=1)
     for i, (name, info) in enumerate(MODEL_INFO.items(), 1):
-        marker = " ★" if name == default_model else "  "
-        desc = info.get("description", "")
-        line = f"  │  {i}) {name:<10} {desc:<28}{marker}│"
-        print(line)
-    print("  └─────────────────────────────────────────────────┘")
+        star = "★" if name == default_model else ""
+        table.add_row(f"{i})", name, info.get("description", ""), f"[yellow]{star}[/yellow]")
+    print()
+    console.print(Panel(table, title="[bold]Choose transcription model[/bold]", border_style="dim", expand=False, width=54))
 
     while True:
         try:
@@ -1444,10 +1430,10 @@ def cmd_live(args):
     engine_label = "mlx (GPU)" if use_mlx else "whisperx (CPU)"
 
     # ── Pre-load whisper model ────────────────────────────────────────────
+    from ui import console
+    from rich.panel import Panel
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  🎙  Live Record + Transcribe                   │")
-    print("  └─────────────────────────────────────────────────┘")
+    console.print(Panel("[bold]🎙 Live Record + Transcribe[/bold]", border_style="dim", expand=False, width=54))
     print()
     print(f"  Engine: {engine_label}")
     print(f"  Loading '{model_name}' model...")
@@ -1471,13 +1457,14 @@ def cmd_live(args):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_path = RECORDINGS_DIR / f"{timestamp}.wav"
 
+    from ui import info_panel
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  Press Ctrl+C to stop recording                 │")
-    print(f"  │  Auto-stops after {SILENCE_TIMEOUT // 60}min silence                 │")
-    print(f"  │  Source: {source_label:<38}│")
-    print(f"  │  Transcribing every {chunk_interval}s in background       │")
-    print("  └─────────────────────────────────────────────────┘")
+    info_panel("🎙 Recording", [
+        ("Source:", source_label),
+        ("Silence:", f"Auto-stops after {SILENCE_TIMEOUT // 60}min"),
+        ("Transcribe:", f"Every {chunk_interval}s in background"),
+        ("Controls:", "Ctrl+C to stop"),
+    ])
     print()
 
     # ── Recording state ───────────────────────────────────────────────────
@@ -1920,17 +1907,16 @@ def cmd_live(args):
 
         _remove_checkpoint(cp_path)
 
+        from ui import success_panel
         print()
-        print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  ✅ Live transcription complete!                │")
-        print("  ├─────────────────────────────────────────────────┤")
-        print(f"  │  Recording:       {format_duration(elapsed):<30}│")
-        print(f"  │  Post-processing: {format_duration(post_time):<30}│")
-        print(f"  │  Chunks done:     {chunks_done:<30}│")
-        print(f"  │  Speakers:        {len(speaker_names):<30}│")
-        print(f"  │  Segments:        {len(result.get('segments', [])):<30}│")
-        print(f"  │  Saved: Scripts/{transcript_file.name:<32}│")
-        print("  └─────────────────────────────────────────────────┘")
+        success_panel("✅ Live transcription complete!", [
+            ("Recording:", format_duration(elapsed)),
+            ("Post-proc:", format_duration(post_time)),
+            ("Chunks:", str(chunks_done)),
+            ("Speakers:", str(len(speaker_names))),
+            ("Segments:", str(len(result.get("segments", [])))),
+            ("Saved to:", f"Scripts/{transcript_file.name}"),
+        ])
         print()
 
         # Log run to history for benchmarking
@@ -1956,102 +1942,95 @@ def cmd_live(args):
 # ─── Transcription with Progress ─────────────────────────────────────────────
 
 class ProgressTracker:
-    """Track and display transcription progress with step-aware progress bar.
+    """Track and display transcription progress as a step list.
 
-    Each step gets a weight so the bar advances when steps change,
-    preventing the 'stuck at 95%' problem during diarization.
+    Shows completed steps with ✓ and duration, current step with spinner.
+    Uses Rich Live for in-place rendering (no scrolling).
     """
 
     def __init__(self, audio_duration, model_name):
+        from ui import console
+        from rich.live import Live
         self.audio_duration = audio_duration
         self.model_name = model_name
-        speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
-        if ENGINE == "mlx":
-            speed_factor *= 0.15
-        diar_engine = config["diarization"].get("engine", "mlx-audio")
-        diar_time = audio_duration * 0.05 if diar_engine == "mlx-audio" else audio_duration * 1.2
-        self.estimated_total = max(10, audio_duration * speed_factor + diar_time)
         self.start_time = time.time()
         self.step_start_time = time.time()
         self.current_step = 0
         self.running = True
         self._thread = None
+        self._live = Live("", console=console, auto_refresh=False)
+        self._completed = []  # [(name, duration_str)]
         self.step_names = STEP_NAMES  # can be overridden before start()
-        # Weight of each step as fraction of total progress
+        # Keep step_weights for compatibility (used by callers for estimated_total)
         diar_engine = config["diarization"].get("engine", "mlx-audio")
         if diar_engine == "mlx-audio":
-            # mlx-audio diarization is fast — transcription dominates
-            # Loading 5%, Transcribing 65%, Aligning 10%, Diarizing 15%, Saving 5%
             self.step_weights = [0.05, 0.65, 0.10, 0.15, 0.05]
         else:
-            # pyannote diarization is slow — it dominates total time
-            # Loading 5%, Transcribing 30%, Aligning 5%, Diarizing 55%, Saving 5%
             self.step_weights = [0.05, 0.30, 0.05, 0.55, 0.05]
+        speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
+        if ENGINE == "mlx":
+            speed_factor *= 0.15
+        diar_time = audio_duration * 0.05 if diar_engine == "mlx-audio" else audio_duration * 1.2
+        self.estimated_total = max(10, audio_duration * speed_factor + diar_time)
 
     def start(self):
-        self._step_times = {}  # {step_index: elapsed_seconds}
+        self._step_times = {}
+        self._live.__enter__()
         self._thread = threading.Thread(target=self._display_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
-        # Record final step time
+        # Record final step
         if hasattr(self, '_step_times') and self.current_step not in self._step_times:
             self._step_times[self.current_step] = time.time() - self.step_start_time
+            name = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "Step"
+            self._completed.append((name, format_duration(self._step_times[self.current_step])))
         self.running = False
         if self._thread:
             self._thread.join(timeout=2)
-        clear_line()
+        # Final render: all steps completed — this becomes permanent output
+        self._render_final()
+        self._live.__exit__(None, None, None)
 
     def set_step(self, step_index):
-        # Record how long the previous step took
         if hasattr(self, '_step_times') and self.current_step < step_index:
             prev_elapsed = time.time() - self.step_start_time
             self._step_times[self.current_step] = prev_elapsed
             prev_name = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "Step"
-            clear_line()
-            print(f"  ✓ {prev_name} ({format_duration(prev_elapsed)})")
+            self._completed.append((prev_name, format_duration(prev_elapsed)))
         self.current_step = step_index
         self.step_start_time = time.time()
+
+    def _render(self, tick=0):
+        """Build the display: completed steps + current step with spinner."""
+        from rich.text import Text
+        lines = []
+        for name, dur in self._completed:
+            lines.append(f"  [green]✓[/green] {name} [dim]({dur})[/dim]")
+
+        if self.running:
+            total_steps = len(self.step_names)
+            step_name = self.step_names[self.current_step] if self.current_step < total_steps else "Processing"
+            step_elapsed = time.time() - self.step_start_time
+            spin = spinner_char(tick)
+            lines.append(f"  {spin} {step_name}... [dim]{format_duration(step_elapsed)}[/dim]")
+
+        self._live.update(Text.from_markup("\n".join(lines)))
+        self._live.refresh()
+
+    def _render_final(self):
+        """Render all steps as completed — becomes permanent output when Live exits."""
+        from rich.text import Text
+        lines = []
+        for name, dur in self._completed:
+            lines.append(f"  [green]✓[/green] {name} [dim]({dur})[/dim]")
+        self._live.update(Text.from_markup("\n".join(lines)))
+        self._live.refresh()
 
     def _display_loop(self):
         tick = 0
         while self.running:
-            elapsed = time.time() - self.start_time
-            step_elapsed = time.time() - self.step_start_time
-            total_steps = len(self.step_names)
-            step_num = self.current_step + 1
-            step_name = self.step_names[self.current_step] if self.current_step < total_steps else "Processing"
-
-            # Step-aware progress: completed steps + partial current step
-            completed = sum(self.step_weights[:self.current_step])
-            current_weight = self.step_weights[self.current_step] if self.current_step < len(self.step_weights) else 0.05
-            # Within current step, use time-based estimate (cap at 90% of step)
-            step_est = max(5, self.estimated_total * current_weight)
-            step_progress = min(0.9, step_elapsed / step_est)
-            total_progress = min(0.99, completed + current_weight * step_progress)
-
-            bar_width = 25
-            filled = int(total_progress * bar_width)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            pct = int(total_progress * 100)
-
-            # ETA based on overall elapsed
-            if total_progress > 0.05:
-                eta = (elapsed / total_progress) * (1 - total_progress)
-            else:
-                eta = max(0, self.estimated_total - elapsed)
-
-            spin = spinner_char(tick)
-            status = (
-                f"  {spin} [{step_num}/{total_steps}] {step_name}... "
-                f"[{bar}] {pct}% │ "
-                f"Elapsed: {format_duration(elapsed)} │ "
-                f"ETA: ~{format_duration(eta)}"
-            )
-            clear_line()
-            sys.stdout.write(status)
-            sys.stdout.flush()
-
+            self._render(tick)
             tick += 1
             time.sleep(0.3)
 
@@ -2386,23 +2365,25 @@ def cmd_run(args):
         else:
             steps_preview = f"{denoise_prefix}Load → Transcribe → Align → Save"
 
-    print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  📝 Transcription                               │")
-    print("  ├─────────────────────────────────────────────────┤")
-    print(f"  │  File:     {Path(audio_path).name:<38}│")
-    print(f"  │  Duration: {format_duration(audio_duration):<38}│")
-    print(f"  │  Engine:   {engine_label:<38}│")
-    print(f"  │  Model:    {model_name} ({model_size}){' ' * max(0, 34 - len(model_name) - len(model_size))}│")
+    from ui import info_panel
+    rows = [
+        ("File:", Path(audio_path).name),
+        ("Duration:", format_duration(audio_duration)),
+        ("Engine:", engine_label),
+        ("Model:", f"{model_name} ({model_size})"),
+    ]
     if ENGINE != "mlx":
-        print(f"  │  Batch:    {batch_size:<38}│")
-    print(f"  │  Language: {language:<38}│")
-    print(f"  │  Denoise:  {denoise_label:<38}│")
-    print(f"  │  Diarize:  {diar_label:<38}│")
-    print(f"  │  Pipeline: {steps_preview:<38}│")
-    print(f"  │  Est time: ~{format_duration(estimated_time):<37}│")
-    print(f"  │  Started:  {datetime.now().strftime('%H:%M:%S'):<38}│")
-    print("  └─────────────────────────────────────────────────┘")
+        rows.append(("Batch:", str(batch_size)))
+    rows += [
+        ("Language:", language),
+        ("Denoise:", denoise_label),
+        ("Diarize:", diar_label),
+        ("Pipeline:", steps_preview),
+        ("Est time:", f"~{format_duration(estimated_time)}"),
+        ("Started:", datetime.now().strftime("%H:%M:%S")),
+    ]
+    print()
+    info_panel("📝 Transcription", rows)
     print()
 
     use_mlx = ENGINE == "mlx"
@@ -2579,32 +2560,26 @@ def cmd_run(args):
         speed_ratio = audio_duration / total_time if total_time > 0 else 0
         speed_label = f"{speed_ratio:.1f}x real-time"
 
-        print()
-        print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  ✅ Transcription complete!                     │")
-        print("  ├─────────────────────────────────────────────────┤")
-        print(f"  │  Audio:     {format_duration(audio_duration)} ({speed_label}){' ' * max(0, 26 - len(format_duration(audio_duration)) - len(speed_label))}│")
-        print(f"  │  Model:     {model_name:<37}│")
-        print(f"  │  Speakers:  {len(speaker_names):<37}│")
-        print(f"  │  Segments:  {len(result.get('segments', [])):<37}│")
-        print(f"  │  Time:      {format_duration(total_time):<37}│")
-        # Show per-step breakdown
-        if hasattr(progress, '_step_times') and progress._step_times:
+        from ui import success_panel
+        rows = [
+            ("Audio:", f"{format_duration(audio_duration)} ({speed_label})"),
+            ("Model:", model_name),
+            ("Speakers:", str(len(speaker_names))),
+            ("Segments:", str(len(result.get("segments", [])))),
+            ("Time:", format_duration(total_time)),
+        ]
+        if hasattr(progress, "_step_times") and progress._step_times:
             parts = []
             for i, name in enumerate(step_names):
                 if i in progress._step_times:
                     parts.append(f"{name}: {format_duration(progress._step_times[i])}")
             if parts:
-                breakdown = " → ".join(parts)
-                # Wrap long breakdowns
-                if len(breakdown) <= 37:
-                    print(f"  │  Steps:    {breakdown:<37}│")
-                else:
-                    print(f"  │  Steps:    {parts[0]:<37}│")
-                    for part in parts[1:]:
-                        print(f"  │            {part:<37}│")
-        print(f"  │  Saved to:  Scripts/{output_file.name:<27}│")
-        print("  └─────────────────────────────────────────────────┘")
+                rows.append(("Steps:", parts[0]))
+                for part in parts[1:]:
+                    rows.append(("", part))
+        rows.append(("Saved to:", f"Scripts/{output_file.name}"))
+        print()
+        success_panel("✅ Transcription complete!", rows)
         print()
 
         # Log run to history for benchmarking
@@ -2644,28 +2619,27 @@ def cmd_list(args):
         print("  No recordings found.")
         return
 
-    print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  📂 Recordings                                  │")
-    print("  ├─────────────────────────────────────────────────┤")
+    from ui import console
+    from rich.table import Table
+    from rich.panel import Panel
 
     max_list = config.get("list", {}).get("max_recordings", 20)
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("st", width=2)
+    table.add_column("num", style="dim", width=3)
+    table.add_column("name")
+    table.add_column("info", style="dim")
     for i, rec in enumerate(recordings[:max_list], 1):
         duration = get_audio_duration(str(rec))
         size_mb = rec.stat().st_size / (1024 * 1024)
-
-        # Check if transcript exists for this recording
-        date_prefix = rec.stem[:10]  # "2026-03-19"
+        date_prefix = rec.stem[:10]
         has_transcript = SCRIPTS_DIR.exists() and any(SCRIPTS_DIR.glob(f"{date_prefix}*.md"))
-        status = "✅" if has_transcript else "  "
-
-        line = f"  │ {status} {i:>2}) {rec.stem}  ({format_duration(duration)}, {size_mb:.1f}MB)"
-        print(f"{line:<52}│")
-
-    print("  └─────────────────────────────────────────────────┘")
+        status = "✅" if has_transcript else ""
+        table.add_row(status, f"{i})", rec.stem, f"{format_duration(duration)}, {size_mb:.1f}MB")
     print()
-    print(f"  📂 {RECORDINGS_DIR}")
-    print(f"  ✅ = transcript exists")
+    console.print(Panel(table, title="[bold]📂 Recordings[/bold]", border_style="dim", expand=False, width=60))
+    console.print(f"  [dim]📂 {RECORDINGS_DIR}[/dim]")
+    console.print("  [dim]✅ = transcript exists[/dim]")
     print()
 
     if recordings:
@@ -3036,15 +3010,13 @@ def cmd_enroll(args):
 
     duration = config.get("speaker_memory", {}).get("enrollment_duration_seconds", 15)
 
+    from ui import info_panel
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  🎤 Voice Enrollment                            │")
-    print("  ├─────────────────────────────────────────────────┤")
-    print(f"  │  Name: {user_name:<42}│")
-    print("  │                                                 │")
-    print(f"  │  Speak naturally for {duration} seconds.{' ' * (16 - len(str(duration)))}│")
-    print("  │  Read something aloud or describe your day.     │")
-    print("  └─────────────────────────────────────────────────┘")
+    info_panel("🎤 Voice Enrollment", [
+        ("Name:", user_name),
+        ("Duration:", f"Speak naturally for {duration} seconds"),
+        ("Tip:", "Read something aloud or describe your day"),
+    ])
     print()
 
     mic_id, mic_name = get_default_mic()
@@ -3151,17 +3123,14 @@ def cmd_enroll(args):
         except Exception:
             print(f"  Tip: add \"user_name\": \"{user_name}\" to config.json")
 
+    from ui import success_panel
     print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  ✅ Voice profile saved!                        │")
-    print("  ├─────────────────────────────────────────────────┤")
-    print(f"  │  Name:     {user_name:<38}│")
-    print(f"  │  Duration: {format_duration(actual_duration):<38}│")
-    print(f"  │  Profile:  speakers/{profile_path.name:<29}│")
-    print("  │                                                 │")
-    print("  │  Your voice will be auto-recognized in future   │")
-    print("  │  transcripts. Everyone else = Person N.         │")
-    print("  └─────────────────────────────────────────────────┘")
+    success_panel("✅ Voice profile saved!", [
+        ("Name:", user_name),
+        ("Duration:", format_duration(actual_duration)),
+        ("Profile:", f"speakers/{profile_path.name}"),
+        ("Note:", "Your voice will be auto-recognized in future transcripts"),
+    ])
     print()
 
 
@@ -3288,20 +3257,18 @@ def cmd_watch(args):
     record_only = watch_cfg.get("record_only", True)
 
     _log("📅 Calendar Watch started")
-    print()
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │  📅 Calendar Watch                               │")
-    print("  │  Auto-records meetings from your calendar        │")
-    print("  ├─────────────────────────────────────────────────┤")
+    from ui import info_panel
     mode_label = "record only → transcribe after" if record_only else "live (record + transcribe)"
-    print(f"  │  Mode:     {mode_label:<38}│")
-    print(f"  │  Model:    {model_name:<38}│")
-    print(f"  │  Silence:  {silence_timeout}min → auto-stop{' ' * 24}│")
-    print(f"  │  Min rec:  {min_recording}min (discard if shorter){' ' * 13}│")
-    print(f"  │  Buffer:   {end_buffer}min after meeting end{' ' * 16}│")
-    print(f"  │  Refresh:  every {refresh_hours}h{' ' * 30}│")
-    print(f"  │  Log:      watch.log{' ' * 28}│")
-    print("  └─────────────────────────────────────────────────┘")
+    print()
+    info_panel("📅 Calendar Watch", [
+        ("Mode:", mode_label),
+        ("Model:", model_name),
+        ("Silence:", f"{silence_timeout}min → auto-stop"),
+        ("Min rec:", f"{min_recording}min (discard if shorter)"),
+        ("Buffer:", f"{end_buffer}min after meeting end"),
+        ("Refresh:", f"every {refresh_hours}h"),
+        ("Log:", "watch.log"),
+    ], subtitle="Auto-records meetings from your calendar")
 
     while True:
         # ── Read today's events ────────────────────────────────
@@ -3516,21 +3483,17 @@ def cmd_install_daemon(args):
                            capture_output=True, text=True)
 
     if result.returncode == 0:
+        from ui import success_panel
         print()
-        print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  ✅ Calendar Watch daemon installed!             │")
-        print("  ├─────────────────────────────────────────────────┤")
-        print("  │  Starts automatically on login                  │")
-        print("  │  Restarts if it crashes                         │")
-        print("  │  Runs silently in background                    │")
-        print("  ├─────────────────────────────────────────────────┤")
-        print(f"  │  Log:    watch.log{' ' * 30}│")
-        print(f"  │  Plist:  ~/Library/LaunchAgents/{' ' * 16}│")
-        print("  │                                                 │")
-        print("  │  Commands:                                      │")
-        print("  │    transcribe watch-status   Check status        │")
-        print("  │    transcribe uninstall-daemon  Remove           │")
-        print("  └─────────────────────────────────────────────────┘")
+        success_panel("✅ Calendar Watch daemon installed!", [
+            ("Startup:", "Starts automatically on login"),
+            ("Recovery:", "Restarts if it crashes"),
+            ("Mode:", "Runs silently in background"),
+            ("Log:", "watch.log"),
+            ("Plist:", "~/Library/LaunchAgents/"),
+            ("Status:", "transcribe watch-status"),
+            ("Remove:", "transcribe uninstall-daemon"),
+        ])
         print()
     else:
         print(f"  ❌ Failed to load daemon: {result.stderr.strip()}")
