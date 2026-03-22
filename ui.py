@@ -179,8 +179,18 @@ class RecordingDisplay:
         """Set a warning message (or None to clear)."""
         self._warnings = [msg] if msg else []
 
-    def update(self, rms, elapsed, silence_elapsed, paused=False):
-        """Refresh the display with current audio state."""
+    def update(self, rms, elapsed, silence_elapsed, paused=False,
+               mic_rms=None, sys_rms=None):
+        """Refresh the display with current audio state.
+
+        Args:
+            rms: combined RMS (max of mic and system)
+            elapsed: seconds since recording started
+            silence_elapsed: seconds of continuous silence
+            paused: whether recording is paused
+            mic_rms: mic channel RMS (optional, for per-channel display)
+            sys_rms: system channel RMS (optional, for per-channel display)
+        """
         if not paused:
             self._rms_history.append(rms)
 
@@ -194,6 +204,11 @@ class RecordingDisplay:
             parts = [f"  ⏺ {time_str}  {wave}  {quality}"]
             if silence_elapsed > 0:
                 parts[0] += f"  [dim]silence {int(silence_elapsed)}s[/dim]"
+            # Per-channel levels when both available
+            if mic_rms is not None and sys_rms is not None:
+                mic_q = "[green]●[/green]" if mic_rms > 0.003 else "[red]●[/red]"
+                sys_q = "[green]●[/green]" if sys_rms > 0.003 else "[red]●[/red]"
+                parts.append(f"  [dim]Mic {mic_q} {mic_rms:.3f}  System {sys_q} {sys_rms:.3f}[/dim]")
 
         for w in self._warnings:
             parts.append(f"  [yellow]⚠ {w}[/yellow]")
