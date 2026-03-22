@@ -8,7 +8,7 @@ Commands:
     transcribe live                 Record + transcribe simultaneously
     transcribe watch                Auto-record meetings from calendar
     transcribe list                 List available recordings
-    transcribe enroll               Save your voice for auto-recognition
+    transcribe list                 List available recordings
     transcribe setup                Audio device setup guide
 """
 
@@ -24,7 +24,6 @@ import sys
 import tempfile
 import threading
 import time
-import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -37,11 +36,6 @@ except ImportError:
     _SystemAudioCapture = None
     _SCK_AVAILABLE = False
 
-# Suppress torchcodec/pyannote/torchaudio deprecation warnings
-warnings.filterwarnings("ignore", message=".*torchcodec.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
-warnings.filterwarnings("ignore", message=".*torchaudio.*deprecated.*")
-warnings.filterwarnings("ignore", message=".*speechbrain.*")
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -51,24 +45,12 @@ CONFIG_PATH = SCRIPT_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     # ── General ──────────────────────────────────────────────────────────
-    # Engine: "mlx" (Apple Silicon GPU — fast) or "whisperx" (CPU — compatible)
-    # mlx uses Apple's Metal GPU via MLX framework — ~7x faster on Apple Silicon
-    # whisperx uses faster-whisper on CPU — works everywhere, has built-in alignment
-    "engine": "mlx",
     # Transcription model: "parakeet" (recommended) or Whisper variants
     # Parakeet: CTC model — no hallucinations, proper punctuation, 2.5GB
-    # Whisper: tiny/base/small/medium/turbo/large-v3 (.en variants for English)
-    # Recommended: "parakeet" for accuracy, "small.en" for low RAM
+    # Whisper: small.en, medium, turbo, large-v3
     "default_model": "parakeet",
     # Language code for transcription (e.g. "en", "ar", "fr")
-    # Set to avoid misdetection — auto-detect can pick wrong language
     "language": "en",
-    # Quantization: "int8" recommended for Apple Silicon (fastest, low RAM)
-    # Options: "int8", "float16", "float32" — only used by whisperx engine
-    "compute_type": "int8",
-    # Processing device: "cpu" for Apple Silicon (MPS not yet supported by WhisperX)
-    # Only used by whisperx engine — mlx always uses Apple GPU
-    "device": "cpu",
 
     # ── Batch sizes per model ────────────────────────────────────────────
     # Higher = faster but more RAM. These are tuned for M1 16GB.
@@ -125,12 +107,7 @@ DEFAULT_CONFIG = {
     "diarization": {
         # Set to false to always skip diarization (faster, no speaker labels)
         "enabled": True,
-        # Engine: "mlx-audio" (fast, Apple GPU, max 4 speakers)
-        #         "pyannote" (slow CPU, unlimited speakers)
-        "engine": "mlx-audio",
-        # Pyannote model — used when engine is "pyannote"
-        "model": "pyannote/speaker-diarization-3.1",
-        # MLX Sortformer model — used when engine is "mlx-audio"
+        # Sortformer model (max 4 speakers per channel)
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
         # Chunk duration in seconds for streaming mode (lower = less RAM)
         "mlx_chunk_duration": 10.0,
@@ -163,19 +140,6 @@ DEFAULT_CONFIG = {
         # > rec_only_ratio: stop transcribing entirely, just record
         # Transcription runs after call ends instead
         "rec_only_ratio": 1.5,
-    },
-
-    # ── Speaker memory (voice recognition) ───────────────────────────────
-    "speaker_memory": {
-        # Auto-match voices against saved profiles
-        "enabled": True,
-        # Cosine similarity threshold (0-1). Higher = stricter matching.
-        # 0.75 recommended — avoids false matches while catching most voices
-        "similarity_threshold": 0.75,
-        # Pyannote embedding model for voice fingerprinting
-        "embedding_model": "pyannote/embedding",
-        # How long to record during 'transcribe enroll' (seconds)
-        "enrollment_duration_seconds": 15,
     },
 
     # ── Calendar watch (auto-record meetings) ────────────────────────────
@@ -219,10 +183,6 @@ DEFAULT_CONFIG = {
         # Max recordings to show in 'transcribe list'
         "max_recordings": 20,
     },
-
-    # Your name — set via 'transcribe enroll' or manually here
-    # Used as the display name when your voice is recognized
-    "user_name": "",
 
     # ── Model definitions ────────────────────────────────────────────────
     # speed_factor: multiplier for time estimation (audio_duration × factor)
@@ -286,12 +246,9 @@ SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 AUDIO_FORMATS = tuple(config["audio_formats"])
 VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")  # filtered from mic selection
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
-DEVICE = config.get("device", "cpu")
-ENGINE = config.get("engine", "mlx")
-SPEAKERS_DIR = SCRIPT_DIR / "speakers"
 
 MODEL_INFO = config["models"]
-STEP_NAMES = ["Loading model", "Transcribing", "Aligning timestamps", "Identifying speakers", "Saving"]
+STEP_NAMES = ["Transcribing", "Saving"]  # default; overridden by cmd_run with actual pipeline steps
 
 
 # ─── Safe File Writing ────────────────────────────────────────────────────────
@@ -970,12 +927,12 @@ def cmd_record(args):
 
 
 def _mix_audio(mic_frames, sys_frames, dual_mode):
-    """Mix mic + system audio into mono. Returns numpy array."""
+    """Mix mic + system audio into mono. Normalizes each channel before mixing."""
     if not mic_frames:
         return np.array([], dtype=np.float32)
-    mic_audio = np.concatenate(mic_frames)
+    mic_audio = _normalize(np.concatenate(mic_frames).flatten())
     if dual_mode and sys_frames:
-        sys_audio = np.concatenate(sys_frames)
+        sys_audio = _normalize(np.concatenate(sys_frames).flatten())
         min_len = min(len(mic_audio), len(sys_audio))
         mic_audio = mic_audio[:min_len]
         sys_audio = sys_audio[:min_len]
@@ -993,16 +950,15 @@ def prompt_transcribe(audio_path):
 
     if answer in ("", "y", "yes"):
         model = prompt_model_selection()
-        speakers = input("  Speaker names [optional, comma-separated — Enter to skip]: ").strip()
         title = input("  Title (or Enter for auto): ").strip()
 
         run_args = argparse.Namespace(
             audio=audio_path,
             model=model,
-            speakers=speakers or None,
             title=title or None,
             language=config["language"],
             no_diarize=False,
+            no_denoise=False,
         )
         cmd_run(run_args)
     else:
@@ -1054,8 +1010,6 @@ def cmd_live(args):
     import sounddevice as sd
     import soundfile as sf
 
-    use_mlx = ENGINE == "mlx"
-
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     model_name = args.model or config["live"].get("model", config["default_model"])
@@ -1063,10 +1017,7 @@ def cmd_live(args):
     batch_size = config["batch_sizes"].get(model_name, 8)
     chunk_interval = config["live"]["chunk_interval_seconds"]
     no_diarize = getattr(args, "no_diarize", False)
-    speakers_str = getattr(args, "speakers", None)
     title = getattr(args, "title", None)
-
-    engine_label = "mlx (GPU)" if use_mlx else "whisperx (CPU)"
 
     # ── Pre-load whisper model ────────────────────────────────────────────
     from ui import console
@@ -1074,18 +1025,10 @@ def cmd_live(args):
     print()
     console.print(Panel("[bold]🎙 Live Record + Transcribe[/bold]", border_style="dim", expand=False, width=54))
     print()
-    print(f"  Engine: {engine_label}")
     print(f"  Loading '{model_name}' model...")
-    if use_mlx:
-        import mlx_whisper
-        # MLX loads model on first transcribe() call — just verify repo exists
-        mlx_repo = _get_mlx_repo(model_name)
-        model = None  # MLX doesn't pre-load
-    else:
-        import whisperx
-        model = whisperx.load_model(
-            model_name, DEVICE, compute_type=config["compute_type"], language=language
-        )
+    import mlx_whisper
+    mlx_repo = _get_mlx_repo(model_name)
+    model = None  # MLX loads on first transcribe() call
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
@@ -1253,10 +1196,7 @@ def cmd_live(args):
             chunk_in_progress = True
             process_start = time.time()
             try:
-                if use_mlx:
-                    result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
-                else:
-                    result = model.transcribe(chunk, batch_size=adaptive["batch_size"])
+                result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
                 process_seconds = time.time() - process_start
 
                 segments = result.get("segments", [])
@@ -1423,10 +1363,7 @@ def cmd_live(args):
         remaining_duration = total_samples / SAMPLE_RATE
         print(f"  ⏳ Transcribing full recording ({format_duration(remaining_duration)})...")
         try:
-            if use_mlx:
-                result = _transcribe_mlx(str(output_path), model_name, language)
-            else:
-                result = model.transcribe(flat_audio, batch_size=adaptive["original_batch_size"])
+            result = _transcribe_mlx(str(output_path), model_name, language)
             segments = result.get("segments", [])
             with transcribe_lock:
                 transcribed_segments.extend(segments)
@@ -1444,10 +1381,7 @@ def cmd_live(args):
         overlap_boundary = last_transcribed_sample / SAMPLE_RATE
 
         try:
-            if use_mlx:
-                result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
-            else:
-                result = model.transcribe(chunk, batch_size=adaptive["original_batch_size"])
+            result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
             segments = result.get("segments", [])
             for seg in segments:
                 seg["start"] = seg.get("start", 0) + offset
@@ -1473,45 +1407,16 @@ def cmd_live(args):
 
     result = {"segments": all_segments, "language": language}
 
-    # ── Alignment (whisperx only — mlx has word timestamps built in) ─────
-    if not use_mlx:
-        print("  ⏳ Aligning timestamps...")
-        try:
-            import whisperx
-            audio_np = whisperx.load_audio(str(output_path))
-            align_model, metadata = whisperx.load_align_model(
-                language_code=language, device=DEVICE
-            )
-            result = whisperx.align(
-                result["segments"], align_model, metadata, audio_np, DEVICE,
-                return_char_alignments=False,
-            )
-            del align_model
-            gc.collect()
-        except Exception as e:
-            print(f"  ⚠  Alignment failed: {e}")
-
     # ── Diarization (always on unless --no-diarize) ─────────────────────
+    # MLX has word timestamps built in — no alignment step needed
     diarize_enabled = config["diarization"]["enabled"] and not no_diarize
     if diarize_enabled and not HF_TOKEN:
         print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
     if HF_TOKEN and diarize_enabled:
         print("  ⏳ Identifying speakers...")
         try:
-            if use_mlx:
-                speaker_turns = _diarize_standalone(str(output_path))
-                result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
-            else:
-                import whisperx
-                from whisperx.diarize import DiarizationPipeline
-                diarize_model = DiarizationPipeline(
-                    model_name=config["diarization"]["model"],
-                    token=HF_TOKEN, device=DEVICE
-                )
-                diarize_segments = diarize_model(str(output_path))
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                del diarize_model
-                gc.collect()
+            speaker_turns = _diarize_standalone(str(output_path))
+            result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
         except Exception as e:
             print(f"  ⚠  Diarization failed: {e}")
 
@@ -1520,7 +1425,7 @@ def cmd_live(args):
     cp_path = _save_checkpoint(result, str(output_path), title)
 
     try:
-        speaker_names = resolve_speaker_names(result, str(output_path), speakers_str)
+        speaker_names = _rename_speakers(result)
 
         if not title:
             title = Path(output_path).stem.replace("_", " ").replace("-", " ").title()
@@ -1529,7 +1434,7 @@ def cmd_live(args):
         date_str = extract_recording_date(str(output_path))
         metadata = {
             "model": model_name,
-            "engine": ENGINE,
+            "engine": "mlx",
             "language": language,
             "audio_duration": elapsed,
             "processing_time": post_time,
@@ -1564,7 +1469,7 @@ def cmd_live(args):
         # Log run to history for benchmarking
         _log_run({
             "model": model_name,
-            "engine": ENGINE,
+            "engine": "mlx",
             "language": language,
             "audio_duration": round(elapsed, 1),
             "processing_time": round(post_time, 1),
@@ -1604,15 +1509,11 @@ class ProgressTracker:
         self._completed = []  # [(name, duration_str)]
         self.step_names = STEP_NAMES  # can be overridden before start()
         # Keep step_weights for compatibility (used by callers for estimated_total)
-        diar_engine = config["diarization"].get("engine", "mlx-audio")
-        if diar_engine == "mlx-audio":
-            self.step_weights = [0.05, 0.65, 0.10, 0.15, 0.05]
-        else:
-            self.step_weights = [0.05, 0.30, 0.05, 0.55, 0.05]
+        # MLX + Sortformer: transcription dominates time
+        self.step_weights = [0.05, 0.65, 0.10, 0.15, 0.05]
         speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
-        if ENGINE == "mlx":
-            speed_factor *= 0.15
-        diar_time = audio_duration * 0.05 if diar_engine == "mlx-audio" else audio_duration * 1.2
+        speed_factor *= 0.15  # MLX GPU acceleration
+        diar_time = audio_duration * 0.05  # Sortformer is fast
         self.estimated_total = max(10, audio_duration * speed_factor + diar_time)
 
     def start(self):
@@ -1677,6 +1578,59 @@ class ProgressTracker:
             time.sleep(0.3)
 
 
+# ─── Audio Loading & Processing ───────────────────────────────────────────────
+
+def _normalize(audio, target_rms=0.05):
+    """Normalize audio to target RMS level. Handles both quiet and loud input."""
+    rms = np.sqrt(np.mean(audio ** 2))
+    if rms > 1e-6:
+        audio = audio * (target_rms / rms)
+    return np.clip(audio, -1.0, 1.0)
+
+
+def _load_audio(path, sr=16000):
+    """Load any audio format via ffmpeg, return mono float32 numpy array at sr Hz."""
+    cmd = [
+        "ffmpeg", "-i", str(path),
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ar", str(sr), "-ac", "1",
+        "-v", "quiet", "-"
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to load {path}: {result.stderr.decode()[:200]}")
+    return np.frombuffer(result.stdout, dtype=np.float32)
+
+
+def _stft(audio, n_fft=2048, hop_length=512):
+    """Short-time Fourier Transform using numpy. Returns complex array (freq_bins, frames)."""
+    window = np.hanning(n_fft)
+    n_frames = 1 + (len(audio) - n_fft) // hop_length
+    frames = np.stack([audio[i * hop_length:i * hop_length + n_fft] * window for i in range(n_frames)])
+    return np.fft.rfft(frames, axis=1).T
+
+
+def _istft(stft_matrix, hop_length=512, length=None):
+    """Inverse STFT with overlap-add reconstruction. Returns float32 audio array."""
+    n_fft = (stft_matrix.shape[0] - 1) * 2
+    n_frames = stft_matrix.shape[1]
+    window = np.hanning(n_fft)
+    output_length = n_fft + hop_length * (n_frames - 1)
+    output = np.zeros(output_length)
+    window_sum = np.zeros(output_length)
+    for i in range(n_frames):
+        frame = np.fft.irfft(stft_matrix[:, i], n=n_fft)
+        start = i * hop_length
+        output[start:start + n_fft] += frame * window
+        window_sum[start:start + n_fft] += window ** 2
+    # Normalize by window overlap
+    nonzero = window_sum > 1e-8
+    output[nonzero] /= window_sum[nonzero]
+    if length is not None:
+        output = output[:length]
+    return output.astype(np.float32)
+
+
 # ─── Audio Denoising ─────────────────────────────────────────────────────────
 
 def _denoise_audio(audio_path):
@@ -1693,31 +1647,30 @@ def _denoise_audio(audio_path):
     if not denoise_cfg.get("enabled", True):
         return audio_path, 0
 
-    import librosa
     import soundfile as sf
 
     factor = denoise_cfg.get("factor", 2.0)
     profile_secs = denoise_cfg.get("noise_profile_seconds", 10)
-    sr = SAMPLE_RATE  # 16 kHz — what Whisper expects
+    sr = SAMPLE_RATE
 
     try:
         t0 = time.time()
-        audio, _ = librosa.load(audio_path, sr=sr)
+        audio = _load_audio(audio_path, sr=sr)
 
         noise_clip = audio[: sr * profile_secs]
         n_fft, hop = 2048, 512
 
-        noise_stft = librosa.stft(noise_clip, n_fft=n_fft, hop_length=hop)
+        noise_stft = _stft(noise_clip, n_fft=n_fft, hop_length=hop)
         noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
 
-        audio_stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+        audio_stft = _stft(audio, n_fft=n_fft, hop_length=hop)
         audio_power = np.abs(audio_stft) ** 2
 
         clean_power = np.maximum(audio_power - factor * noise_power, 0.0)
         gain = np.sqrt(clean_power / (audio_power + 1e-10))
         clean_stft = audio_stft * gain
 
-        denoised = librosa.istft(clean_stft, hop_length=hop, length=len(audio))
+        denoised = _istft(clean_stft, hop_length=hop, length=len(audio))
         denoised = denoised.astype(np.float32)
 
         # Write to temp file next to the original
@@ -1859,47 +1812,9 @@ def _diarize_mlx_audio(audio_path):
     return turns
 
 
-def _diarize_pyannote(audio_path):
-    """Run pyannote speaker diarization (slower CPU, unlimited speakers).
-
-    Pre-loads audio with torchaudio to bypass broken torchcodec in pyannote 4.x.
-    """
-    import torch
-    import torchaudio
-    from pyannote.audio import Pipeline as PyannotePipeline
-
-    pipeline = PyannotePipeline.from_pretrained(
-        config["diarization"]["model"],
-        token=HF_TOKEN,
-    )
-
-    # Load audio ourselves — avoids pyannote's broken torchcodec path
-    waveform, sample_rate = torchaudio.load(audio_path)
-    audio_input = {"waveform": waveform, "sample_rate": sample_rate}
-
-    diarization = pipeline(audio_input)
-
-    # pyannote 4.x wraps result in DiarizeOutput — unwrap to get Annotation
-    if hasattr(diarization, "speaker_diarization"):
-        diarization = diarization.speaker_diarization
-
-    # Build speaker turn list
-    turns = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
-
-    del pipeline
-    gc.collect()
-    return turns
-
-
 def _diarize_standalone(audio_path):
-    """Route to the configured diarization engine."""
-    engine = config["diarization"].get("engine", "mlx-audio")
-    if engine == "mlx-audio":
-        return _diarize_mlx_audio(audio_path)
-    else:
-        return _diarize_pyannote(audio_path)
+    """Run speaker diarization using MLX Sortformer."""
+    return _diarize_mlx_audio(audio_path)
 
 
 def _assign_speakers_to_segments(segments, speaker_turns):
@@ -1943,7 +1858,7 @@ def cmd_run(args):
         model_name = prompt_model_selection()
 
     language = getattr(args, "language", None) or config["language"]
-    speakers_str = getattr(args, "speakers", None)
+
     title = getattr(args, "title", None)
     no_diarize = getattr(args, "no_diarize", False)
     no_denoise = getattr(args, "no_denoise", False)
@@ -1969,43 +1884,26 @@ def cmd_run(args):
         audio_duration = 300  # assume 5 minutes as fallback
 
     speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
-    if ENGINE == "mlx":
-        speed_factor *= 0.15  # MLX is ~7x faster than CPU
+    speed_factor *= 0.15  # MLX GPU acceleration
     estimated_time = audio_duration * speed_factor
-    # Add diarization time estimate
-    diar_engine = config["diarization"].get("engine", "mlx-audio")
     diarize_enabled = config["diarization"]["enabled"] and not no_diarize
     if diarize_enabled:
-        if diar_engine == "mlx-audio":
-            estimated_time += audio_duration * 0.05  # ~3s per minute
-        else:
-            estimated_time += audio_duration * 1.2  # pyannote is ~1.2x audio length on CPU
+        estimated_time += audio_duration * 0.05  # Sortformer: ~3s per minute
 
-    # Parakeet doesn't need denoising (CTC can't hallucinate on silence)
     is_parakeet_model = _is_parakeet(model_name)
     denoise_enabled = config.get("denoise", {}).get("enabled", True) and not no_denoise and not is_parakeet_model
     denoise_factor = config.get("denoise", {}).get("factor", 2.0)
 
-    engine_label = "parakeet (GPU)" if is_parakeet_model else ("mlx (GPU)" if ENGINE == "mlx" else "whisperx (CPU)")
+    engine_label = "parakeet (GPU)" if is_parakeet_model else "mlx (GPU)"
     model_size = MODEL_INFO.get(model_name, {}).get("size", "?")
-    model_desc = MODEL_INFO.get(model_name, {}).get("description", "")
-    diar_label = "off"
-    if diarize_enabled:
-        diar_label = f"{diar_engine} (GPU)" if diar_engine == "mlx-audio" else f"{diar_engine} (CPU)"
+    diar_label = "Sortformer (GPU)" if diarize_enabled else "off"
     denoise_label = f"spectral sub {denoise_factor}x" if denoise_enabled else "off"
 
-    # Determine pipeline steps for display
     denoise_prefix = "Denoise → " if denoise_enabled else ""
-    if ENGINE == "mlx":
-        if diarize_enabled:
-            steps_preview = f"{denoise_prefix}Diarize → Transcribe → Save"
-        else:
-            steps_preview = f"{denoise_prefix}Load model → Transcribe → Save"
+    if diarize_enabled:
+        steps_preview = f"{denoise_prefix}Diarize → Transcribe → Save"
     else:
-        if diarize_enabled:
-            steps_preview = f"{denoise_prefix}Load → Transcribe → Align → Diarize → Save"
-        else:
-            steps_preview = f"{denoise_prefix}Load → Transcribe → Align → Save"
+        steps_preview = f"{denoise_prefix}Transcribe → Save"
 
     from ui import info_panel
     rows = [
@@ -2013,10 +1911,6 @@ def cmd_run(args):
         ("Duration:", format_duration(audio_duration)),
         ("Engine:", engine_label),
         ("Model:", f"{model_name} ({model_size})"),
-    ]
-    if ENGINE != "mlx":
-        rows.append(("Batch:", str(batch_size)))
-    rows += [
         ("Language:", language),
         ("Denoise:", denoise_label),
         ("Diarize:", diar_label),
@@ -2028,25 +1922,15 @@ def cmd_run(args):
     info_panel("📝 Transcription", rows)
     print()
 
-    use_mlx = ENGINE == "mlx"
     diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
 
-    # Pipeline steps differ by engine and diarization:
-    #   MLX skips alignment (word_timestamps built-in)
-    #   MLX diarizes FIRST to avoid GPU memory contention
-    PIPELINE_STEPS = {
-        ("mlx", True):  (["Identifying speakers", "Transcribing", "Saving"],
-                         [0.15, 0.80, 0.05]),
-        ("mlx", False): (["Loading model", "Transcribing", "Saving"],
-                         [0.05, 0.90, 0.05]),
-        ("cpu", True):  (["Loading model", "Transcribing", "Aligning timestamps",
-                          "Identifying speakers", "Saving"],
-                         [0.05, 0.45, 0.10, 0.35, 0.05]),
-        ("cpu", False): (["Loading model", "Transcribing", "Aligning timestamps", "Saving"],
-                         [0.05, 0.70, 0.20, 0.05]),
-    }
-    engine_key = "mlx" if use_mlx else "cpu"
-    step_names, step_weights = PIPELINE_STEPS[(engine_key, bool(diarize_enabled))]
+    # Pipeline steps: MLX diarizes FIRST to avoid GPU memory contention
+    if diarize_enabled:
+        step_names = ["Identifying speakers", "Transcribing", "Saving"]
+        step_weights = [0.15, 0.80, 0.05]
+    else:
+        step_names = ["Transcribing", "Saving"]
+        step_weights = [0.90, 0.10]
 
     # Prepend denoising step if enabled
     if denoise_enabled:
@@ -2073,80 +1957,31 @@ def cmd_run(args):
         else:
             transcribe_path = audio_path
 
-        if use_mlx:
-            import mlx.core as mx
-            # ── MLX engine (Apple Silicon GPU) ──
-            # Diarize FIRST with small Sortformer model (~100MB),
-            # free GPU memory, THEN transcribe with large Whisper model.
-            # Metal GPU crashes if two models run simultaneously.
-            speaker_turns = None
+        import mlx.core as mx
+        # Diarize FIRST with small Sortformer model (~100MB),
+        # free GPU memory, THEN transcribe with large Whisper/Parakeet model.
+        speaker_turns = None
 
-            if diarize_enabled:
-                progress.set_step(step)  # Identifying speakers
-                # Diarize on original audio (denoising can distort speaker embeddings)
-                speaker_turns = _diarize_standalone(audio_path)
-                gc.collect()
-                mx.clear_cache()  # Free Sortformer GPU memory before loading Whisper
-                step += 1
-
-            progress.set_step(step)  # Transcribing
-            if _is_parakeet(model_name):
-                result = _transcribe_parakeet(transcribe_path, model_name)
-            else:
-                # Skip word_timestamps when diarizing — we only need segment-level
-                result = _transcribe_mlx(transcribe_path, model_name, language,
-                                         word_timestamps=not diarize_enabled)
-
-            if speaker_turns is not None:
-                result["segments"] = _assign_speakers_to_segments(
-                    result.get("segments", []), speaker_turns)
-
+        if diarize_enabled:
+            progress.set_step(step)  # Identifying speakers
+            speaker_turns = _diarize_standalone(audio_path)
+            gc.collect()
+            mx.clear_cache()  # Free Sortformer GPU memory
             step += 1
-            progress.set_step(step)  # Saving
+
+        progress.set_step(step)  # Transcribing
+        if _is_parakeet(model_name):
+            result = _transcribe_parakeet(transcribe_path, model_name)
         else:
-            # ── WhisperX engine (CPU) ──
-            import whisperx
+            result = _transcribe_mlx(transcribe_path, model_name, language,
+                                     word_timestamps=not diarize_enabled)
 
-            progress.set_step(step)  # Loading model
-            model = whisperx.load_model(
-                model_name, DEVICE, compute_type=config["compute_type"], language=language
-            )
+        if speaker_turns is not None:
+            result["segments"] = _assign_speakers_to_segments(
+                result.get("segments", []), speaker_turns)
 
-            step += 1
-            progress.set_step(step)  # Transcribing
-            audio = whisperx.load_audio(transcribe_path)
-            result = model.transcribe(audio, batch_size=batch_size)
-            detected_language = result.get("language", language)
-            del model
-            gc.collect()
-
-            step += 1
-            progress.set_step(step)  # Aligning timestamps
-            align_model, metadata = whisperx.load_align_model(
-                language_code=detected_language, device=DEVICE
-            )
-            result = whisperx.align(
-                result["segments"], align_model, metadata, audio, DEVICE,
-                return_char_alignments=False,
-            )
-            del align_model
-            gc.collect()
-
-            if diarize_enabled:
-                step += 1
-                progress.set_step(step)  # Identifying speakers
-                from whisperx.diarize import DiarizationPipeline
-                diarize_model = DiarizationPipeline(
-                    model_name=config["diarization"]["model"],
-                    token=HF_TOKEN, device=DEVICE
-                )
-                diarize_segments = diarize_model(audio_path)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                del diarize_model
-                gc.collect()
-
-            step += 1
-            progress.set_step(step)  # Saving
+        step += 1
+        progress.set_step(step)  # Saving
 
     except Exception as e:
         progress.stop()
@@ -2173,15 +2008,15 @@ def cmd_run(args):
     cp_path = _save_checkpoint(result, audio_path, title)
 
     try:
-        # Resolve speaker names (auto-match from saved profiles + -s flag)
-        speaker_names = resolve_speaker_names(result, audio_path, speakers_str)
+        # Rename speaker IDs to "Speaker 1", "Speaker 2", etc.
+        speaker_names = _rename_speakers(result)
 
         # Save transcript
         total_time = time.time() - progress.start_time
         date_str = extract_recording_date(audio_path)
         metadata = {
             "model": model_name,
-            "engine": ENGINE,
+            "engine": "mlx",
             "language": language,
             "audio_duration": audio_duration,
             "processing_time": total_time,
@@ -2242,7 +2077,7 @@ def cmd_run(args):
                     step_log[name] = progress._step_times[i]
         _log_run({
             "model": model_name,
-            "engine": ENGINE,
+            "engine": "mlx",
             "language": language,
             "audio_duration": round(audio_duration, 1),
             "processing_time": round(total_time, 1),
@@ -2446,344 +2281,18 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
     return "\n".join(lines)
 
 
-# ─── Speaker Memory ──────────────────────────────────────────────────────────
 
-def load_embedding_model():
-    """Load pyannote embedding model for speaker recognition."""
-    memory_cfg = config.get("speaker_memory", {})
-    model_name = memory_cfg.get("embedding_model", "pyannote/embedding")
-    try:
-        from pyannote.audio import Inference
-        model = Inference(model_name, window="whole", token=HF_TOKEN)
-        return model
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "403" in str(e) or "gated" in error_msg or "access" in error_msg:
-            print(f"  ⚠  Speaker embedding model requires HuggingFace terms acceptance.")
-            print(f"     Accept at: https://huggingface.co/{model_name}")
-        else:
-            print(f"  ⚠  Failed to load embedding model: {e}")
-        return None
-
-
-def extract_speaker_embedding(embedding_model, audio_path, segments):
-    """Extract average embedding for a speaker from their audio segments."""
-    from pyannote.core import Segment
-
-    embeddings = []
-    total_duration = 0
-
-    for start, end in segments:
-        duration = end - start
-        if duration < 1.0:
-            continue
-        total_duration += duration
-        try:
-            emb = embedding_model.crop(audio_path, Segment(start, end))
-            emb = np.array(emb).flatten()
-            if emb.shape[0] > 0:
-                embeddings.append(emb)
-        except Exception:
-            continue
-
-    if not embeddings or total_duration < 2.0:
-        return None
-
-    # Average and L2-normalize
-    avg = np.mean(embeddings, axis=0)
-    norm = np.linalg.norm(avg)
-    if norm > 0:
-        avg = avg / norm
-    return avg
-
-
-def load_speaker_profiles():
-    """Load all saved voice profiles from speakers/ directory."""
-    profiles = {}
-    if not SPEAKERS_DIR.exists():
-        return profiles
-    for f in SPEAKERS_DIR.glob("*.npz"):
-        try:
-            with np.load(f, allow_pickle=True) as data:
-                if "name" not in data or "embedding" not in data:
-                    continue
-                profiles[f.stem] = {
-                    "name": str(data["name"]),
-                    "embedding": np.array(data["embedding"]),
-                }
-        except Exception:
-            continue
-    return profiles
-
-
-def save_speaker_profile(name, embedding):
-    """Save a voice profile to speakers/ directory."""
-    SPEAKERS_DIR.mkdir(parents=True, exist_ok=True)
-    profile_path = SPEAKERS_DIR / f"{name.lower()}.npz"
-
-    def _write(path):
-        np.savez(path, name=name, embedding=embedding,
-                 enrolled_at=datetime.now().strftime("%Y-%m-%d"))
-
-    saved_to = _safe_write_binary(profile_path, _write, description="speaker profile")
-    return saved_to or profile_path
-
-
-def match_speakers(speaker_embeddings, saved_profiles, threshold=0.75):
-    """Match diarized speakers against saved profiles using cosine similarity.
-
-    Returns: dict {speaker_id: (display_name, similarity_score)}
-    """
-    if not saved_profiles or not speaker_embeddings:
-        return {}
-
-    scores = []
-    for spk_id, spk_emb in speaker_embeddings.items():
-        if spk_emb is None:
-            continue
-        for prof_key, profile in saved_profiles.items():
-            prof_emb = profile.get("embedding")
-            if prof_emb is None:
-                continue
-            similarity = float(np.dot(spk_emb, prof_emb) / (
-                np.linalg.norm(spk_emb) * np.linalg.norm(prof_emb) + 1e-8
-            ))
-            scores.append((similarity, spk_id, profile["name"]))
-
-    # Greedy assignment: best scores first, each profile/speaker used once
-    scores.sort(reverse=True)
-    matched = {}
-    used_profiles = set()
-    used_speakers = set()
-
-    for similarity, spk_id, name in scores:
-        if similarity < threshold:
-            break
-        if spk_id in used_speakers or name in used_profiles:
-            continue
-        matched[spk_id] = (name, similarity)
-        used_speakers.add(spk_id)
-        used_profiles.add(name)
-
-    return matched
-
-
-def resolve_speaker_names(result, audio_path, speakers_str=None):
-    """Resolve speaker IDs to display names.
-
-    Priority: -s flag > saved profile match > Person N
-    """
+def _rename_speakers(result):
+    """Rename diarization speaker IDs (SPEAKER_00 → Speaker 1)."""
     segments = result.get("segments") or []
     speaker_ids = sorted(set(seg.get("speaker", "Unknown") for seg in segments))
-
-    if not speaker_ids:
-        return {}
-
-    speaker_names = {}
-    matched = {}
-    memory_cfg = config.get("speaker_memory", {})
-    memory_enabled = memory_cfg.get("enabled", True)
-
-    # Step 1: Match against saved voice profiles
-    if memory_enabled and HF_TOKEN:
-        profiles = load_speaker_profiles()
-        if profiles:
-            print("  🔍 Matching voices...")
-            embedding_model = load_embedding_model()
-            if embedding_model is not None:
-                # Group segments by speaker
-                speaker_segments = {}
-                for seg in segments:
-                    sid = seg.get("speaker", "Unknown")
-                    if sid not in speaker_segments:
-                        speaker_segments[sid] = []
-                    speaker_segments[sid].append(
-                        (seg.get("start", 0), seg.get("end", 0))
-                    )
-
-                # Extract embedding per speaker
-                speaker_embeddings = {}
-                for sid, segs in speaker_segments.items():
-                    speaker_embeddings[sid] = extract_speaker_embedding(
-                        embedding_model, audio_path, segs
-                    )
-
-                threshold = memory_cfg.get("similarity_threshold", 0.75)
-                matched = match_speakers(speaker_embeddings, profiles, threshold)
-                for sid, (name, _score) in matched.items():
-                    speaker_names[sid] = name
-
-                del embedding_model
-                gc.collect()
-
-    # Step 2: -s flag overrides
-    if speakers_str:
-        names = [n.strip() for n in speakers_str.split(",")]
-        for i, sid in enumerate(speaker_ids):
-            if i < len(names) and names[i]:
-                speaker_names[sid] = names[i]
-
-    # Step 3: Fill remaining with Person N
-    person_counter = 1
-    for sid in speaker_ids:
-        if sid not in speaker_names:
-            speaker_names[sid] = f"Person {person_counter}"
-            person_counter += 1
-
-    # Print results
-    if matched or speakers_str:
-        print("  🔊 Speakers:")
-        for sid in speaker_ids:
-            name = speaker_names[sid]
-            if sid in matched:
-                _, score = matched[sid]
-                print(f"     {sid} → {name} ({int(score * 100)}% match)")
-            else:
-                print(f"     {sid} → {name}")
-
-    return speaker_names
-
-
-def cmd_enroll(args):
-    """Record a voice sample and save profile for auto-recognition."""
-    import sounddevice as sd
-    import soundfile as sf
-
-    user_name = getattr(args, "name", None) or config.get("user_name", "")
-    if not user_name:
-        try:
-            user_name = input("  Enter your name: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-    if not user_name:
-        print("  ❌ Name required.")
-        return
-
-    duration = config.get("speaker_memory", {}).get("enrollment_duration_seconds", 15)
-
-    from ui import info_panel
-    print()
-    info_panel("🎤 Voice Enrollment", [
-        ("Name:", user_name),
-        ("Duration:", f"Speak naturally for {duration} seconds"),
-        ("Tip:", "Read something aloud or describe your day"),
-    ])
-    print()
-
-    mic_id, mic_name = get_default_mic()
-    print(f"  🎙  Using: {mic_name}")
-
-    try:
-        input("  Press Enter to start recording...")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    frames = []
-    recording = True
-    start_time = time.time()
-
-    def callback(indata, frame_count, time_info, status):
-        nonlocal recording
-        if not recording:
-            raise sd.CallbackAbort()
-        mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
-        frames.append(mono.copy())
-
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-        device=mic_id, blocksize=int(SAMPLE_RATE * 0.5), callback=callback,
-    )
-
-    try:
-        stream.start()
-        while recording:
-            elapsed = time.time() - start_time
-            remaining = duration - elapsed
-            if remaining <= 0:
-                recording = False
-                break
-            bar_width = 25
-            progress = min(1.0, elapsed / duration)
-            filled = int(progress * bar_width)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            clear_line()
-            sys.stdout.write(f"  ⏺  Recording... [{bar}] {int(remaining)}s remaining")
-            sys.stdout.flush()
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        recording = False
-    finally:
-        stream.stop()
-        stream.close()
-    clear_line()
-
-    if not frames:
-        print("  ❌ No audio captured.")
-        return
-
-    audio = np.concatenate(frames)
-    actual_duration = len(audio) / SAMPLE_RATE
-
-    if actual_duration < 3:
-        print(f"  ❌ Too short ({format_duration(actual_duration)}). Need at least 3 seconds.")
-        return
-
-    # Save temp file for embedding extraction
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp_path = tmp.name
-    sf.write(tmp_path, audio, SAMPLE_RATE, subtype="PCM_16")
-
-    print(f"  ⏳ Extracting voice profile...")
-    embedding_model = load_embedding_model()
-    if embedding_model is None:
-        os.unlink(tmp_path)
-        return
-
-    embedding = extract_speaker_embedding(
-        embedding_model, tmp_path, [(0, actual_duration)]
-    )
-    os.unlink(tmp_path)
-    del embedding_model
-    gc.collect()
-
-    if embedding is None:
-        print("  ❌ Could not extract voice profile. Try speaking louder or longer.")
-        return
-
-    # Check existing profile
-    profile_path = SPEAKERS_DIR / f"{user_name.lower()}.npz"
-    if profile_path.exists():
-        try:
-            answer = input(f"  Profile for '{user_name}' exists. Overwrite? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if answer not in ("y", "yes"):
-            print("  ─  Keeping existing profile.")
-            return
-
-    save_speaker_profile(user_name, embedding)
-
-    # Save user_name to config if not set
-    if not config.get("user_name"):
-        config["user_name"] = user_name
-        try:
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(config, f, indent=4)
-            print(f"  ✅ Saved name '{user_name}' to config.json")
-        except Exception:
-            print(f"  Tip: add \"user_name\": \"{user_name}\" to config.json")
-
-    from ui import success_panel
-    print()
-    success_panel("✅ Voice profile saved!", [
-        ("Name:", user_name),
-        ("Duration:", format_duration(actual_duration)),
-        ("Profile:", f"speakers/{profile_path.name}"),
-        ("Note:", "Your voice will be auto-recognized in future transcripts"),
-    ])
-    print()
+    name_map = {}
+    for i, sid in enumerate(speaker_ids):
+        name_map[sid] = f"Speaker {i + 1}"
+    # Print speaker count
+    if len(name_map) > 1:
+        print(f"  🔊 {len(name_map)} speakers detected")
+    return name_map
 
 
 # ─── Calendar Watch ──────────────────────────────────────────────────────────
@@ -3228,7 +2737,6 @@ Examples:
     run_parser = subparsers.add_parser("run", help="Transcribe a recording")
     run_parser.add_argument("audio", nargs="?", default=None, help="Audio file path")
     run_parser.add_argument("--model", "-m", default=None, help="Model: tiny/base/small/medium/large-v3")
-    run_parser.add_argument("--speakers", "-s", default=None, help="Speaker names (comma-separated)")
     run_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     run_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
     run_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
@@ -3237,14 +2745,9 @@ Examples:
     # live
     live_parser = subparsers.add_parser("live", help="Record + transcribe simultaneously")
     live_parser.add_argument("--model", "-m", default=None, help="Model (default: from config)")
-    live_parser.add_argument("--speakers", "-s", default=None, help="Speaker names (comma-separated)")
     live_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     live_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
     live_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
-
-    # enroll
-    enroll_parser = subparsers.add_parser("enroll", help="Save your voice for auto-recognition")
-    enroll_parser.add_argument("--name", "-n", default=None, help="Your name (default: from config)")
 
     # watch
     watch_parser = subparsers.add_parser("watch", help="Auto-record meetings from calendar")
@@ -3272,8 +2775,6 @@ Examples:
         cmd_run(args)
     elif args.command == "live":
         cmd_live(args)
-    elif args.command == "enroll":
-        cmd_enroll(args)
     elif args.command == "watch":
         cmd_watch(args)
     elif args.command == "install-daemon":
@@ -3292,8 +2793,7 @@ Examples:
         parser.print_help()
         print()
         print("  Quick start:")
-        print("    transcribe enroll — Save your voice (one time)")
-        print("    transcribe setup  — Set up audio (first time)")
+        print("    transcribe setup  — Check audio setup")
         print("    transcribe rec    — Record audio")
         print("    transcribe run    — Transcribe a recording")
         print("    transcribe live   — Record + transcribe at once")

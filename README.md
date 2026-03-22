@@ -35,9 +35,8 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - **System health monitoring** — warns when CPU or RAM usage exceeds 85%
 
 ### Speaker Identification
-- **Speaker diarization** — identifies who said what using Sortformer (GPU) or pyannote (CPU)
-- **Voice enrollment** — record 15 seconds of your voice, get auto-recognized in every transcript
-- **Up to 4 speakers** — via Sortformer on GPU (unlimited with pyannote CPU fallback)
+- **Speaker diarization** — identifies who said what using Sortformer on Apple GPU
+- **Up to 4 speakers** per channel — automatically separated and labeled
 - **Configurable sensitivity** — tune detection threshold, minimum duration, and merge gap
 
 ### Automation
@@ -80,12 +79,8 @@ The installer creates a virtual environment, installs dependencies, and adds the
 Speaker identification requires a free Hugging Face token:
 
 1. Create a free account at [huggingface.co](https://huggingface.co)
-2. Accept terms for these models:
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-   - [pyannote/embedding](https://huggingface.co/pyannote/embedding) (for voice recognition)
-3. Generate a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-4. Add to your shell:
+2. Generate a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+3. Add to your shell:
    ```bash
    echo 'export HF_TOKEN=your_token_here' >> ~/.zshrc
    ```
@@ -117,7 +112,6 @@ transcribe live                              # Record + transcribe simultaneousl
 | `transcribe rec` | Record audio (auto-stops after silence) |
 | `transcribe live` | Record + transcribe at the same time |
 | `transcribe list` | Browse past recordings |
-| `transcribe enroll` | Save your voice for auto-recognition |
 | `transcribe watch` | Auto-record meetings from calendar |
 | `transcribe install-daemon` | Run calendar watch as background service |
 | `transcribe uninstall-daemon` | Remove background service |
@@ -140,7 +134,6 @@ The transcript is saved as Markdown to your configured output folder.
 |------|---------|-------------|
 | `-m` | `-m turbo` | Use a different model (default: parakeet) |
 | `-t` | `-t "Team Meeting"` | Set the transcript title |
-| `-s` | `-s "Alice,Bob"` | Name the speakers |
 | `-l` | `-l ar` | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
 | `--no-diarize` | | Skip speaker identification (faster) |
 | `--no-denoise` | | Skip audio denoising (Whisper models only) |
@@ -151,8 +144,8 @@ The transcript is saved as Markdown to your configured output folder.
 # Transcribe a podcast
 transcribe run ~/Downloads/episode.mp3 -t "Episode 42" --no-diarize
 
-# Meeting with named speakers
-transcribe run ~/Downloads/meeting.m4a -t "Q1 Review" -s "Alice,Bob,Carol"
+# Meeting with title
+transcribe run ~/Downloads/meeting.m4a -t "Q1 Review"
 
 # Lecture in Arabic
 transcribe run ~/Downloads/lecture.wav -m small -l ar
@@ -169,23 +162,12 @@ Record and transcribe at the same time. Audio is transcribed in background chunk
 transcribe live                              # Uses config defaults
 transcribe live -m medium                    # Use a specific model
 transcribe live -t "Team Standup"            # Set title
-transcribe live -s "Alice,Bob" --no-diarize  # Name speakers manually
+transcribe live --no-diarize                 # Skip speaker identification
 ```
 
 **Adaptive scaling:** If your machine is struggling, live mode automatically increases the interval between chunks, reduces batch size, or falls back to record-only mode (transcribes after the call ends).
 
 Audio quality indicators show during recording — green/yellow/red for mic and system audio levels.
-
-### Voice Enrollment
-
-Enroll your voice once, and your name appears automatically in every transcript:
-
-```bash
-transcribe enroll                  # Records 15 seconds of your voice
-transcribe enroll -n "Alice"       # Set name directly
-```
-
-Everyone else shows as `Person 1`, `Person 2`, etc. You can still name others with `-s` when needed.
 
 ### Calendar Watch
 
@@ -308,10 +290,8 @@ Any value you omit uses the built-in default.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `engine` | `"mlx"` | `"mlx"` runs on Apple GPU (fast). `"whisperx"` runs on CPU (compatible with any machine) |
 | `default_model` | `"parakeet"` | Which model to use. `"parakeet"` for best accuracy, or Whisper: `"small.en"`, `"medium"`, `"turbo"`, `"large-v3"` |
 | `language` | `"en"` | Language code. Set explicitly to avoid misdetection. [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
-| `user_name` | `""` | Your name — used in speaker recognition to label your voice in transcripts |
 | `auto_title_from_calendar` | `true` | When recording during a calendar event, use the event name as the transcript title |
 
 ### Whisper Settings
@@ -346,17 +326,15 @@ Spectral subtraction pre-processing. Only applies to Whisper models — Parakeet
 |-----|---------|--------------|
 | `recording.silence_threshold` | `0.005` | RMS audio level below which the signal is considered silence. Lower = more sensitive |
 | `recording.silence_timeout_minutes` | `10` | Stop recording after this many minutes of continuous silence |
-| `recording.blackhole_device` | `"BlackHole 2ch"` | Name of the virtual audio device for system audio capture |
 | `recording.mic_low_warning_seconds` | `10` | Show a warning if mic input stays very low for this many seconds |
 
 ### Speaker Diarization
 
-Controls who-said-what detection.
+Uses Sortformer on Apple GPU (max 4 speakers per channel).
 
 | Key | Default | What it does |
 |-----|---------|--------------|
 | `diarization.enabled` | `true` | Whether to identify individual speakers in the transcript |
-| `diarization.engine` | `"mlx-audio"` | `"mlx-audio"` uses Sortformer on GPU (fast, max 4 speakers). `"pyannote"` uses CPU (slower, unlimited speakers) |
 | `diarization.threshold` | `0.5` | Speaker detection sensitivity (0-1). Lower catches more speech but may produce false detections |
 | `diarization.min_duration` | `0.0` | Ignore speaker segments shorter than this (seconds). Filters micro-segments and blips |
 | `diarization.merge_gap` | `0.0` | Merge segments from the same speaker that are closer than this gap (seconds). Reduces fragmentation |
@@ -374,14 +352,6 @@ Controls who-said-what detection.
 | `live.struggle_ratio` | `0.7` | If transcription takes longer than this ratio of the chunk duration, increase the interval |
 | `live.rec_only_ratio` | `1.5` | If transcription takes longer than this ratio, stop transcribing and just record |
 
-### Speaker Memory
-
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `speaker_memory.enabled` | `true` | Auto-match voices in new recordings against enrolled voice profiles |
-| `speaker_memory.similarity_threshold` | `0.75` | How similar a voice must be to a profile to match (0-1). Lower = more lenient matching |
-| `speaker_memory.enrollment_duration_seconds` | `15` | How many seconds of speech to record when enrolling a new voice |
-
 ### Calendar Watch
 
 | Key | Default | What it does |
@@ -396,7 +366,7 @@ Controls who-said-what detection.
 
 ### Batch Sizes
 
-Per-model batch sizes for the WhisperX CPU engine (higher = faster, more RAM). Tuned for M1 16GB:
+Per-model batch sizes for adaptive chunking in live mode. Tuned for M1 16GB:
 
 ```json
 "batch_sizes": { "small.en": 16, "medium": 8, "turbo": 4, "large-v3": 4 }
@@ -424,7 +394,7 @@ Reduce if you get memory errors. Increase on machines with more RAM. Not used by
 ./uninstall.sh
 ```
 
-Removes: virtual environment, shell alias, watch daemon, speaker profiles, log files, and config. Optionally removes cached AI models and output data.
+Removes: virtual environment, shell alias, watch daemon, log files, and config. Optionally removes cached AI models and output data.
 
 ## License
 
@@ -436,6 +406,4 @@ Removes: virtual environment, shell alias, watch daemon, speaker profiles, log f
 - [Sortformer](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/configs.html) — neural speaker diarization from NVIDIA NeMo
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) — MLX bindings for Parakeet, Sortformer, and Whisper on Apple Silicon
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper on Apple Silicon GPU via MLX
-- [WhisperX](https://github.com/m-bain/whisperX) — fast Whisper with word-level timestamps (CPU fallback)
-- [pyannote.audio](https://github.com/pyannote/pyannote-audio) — speaker diarization and voice embeddings
-- [BlackHole](https://github.com/ExistentialAudio/BlackHole) — virtual audio driver for macOS
+- [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) — macOS system audio capture
