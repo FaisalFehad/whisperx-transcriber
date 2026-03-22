@@ -232,7 +232,7 @@ class SystemAudioCapture:
             )
             cfg = _SCKit.SCStreamConfiguration.alloc().init()
             cfg.setCapturesAudio_(True)
-            cfg.setExcludesCurrentProcessAudio_(False)
+            cfg.setExcludesCurrentProcessAudio_(True)
             cfg.setSampleRate_(float(self._rate))
             cfg.setChannelCount_(1)
 
