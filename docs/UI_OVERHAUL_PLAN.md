@@ -1,7 +1,25 @@
 # UI Overhaul Plan — whisperx-transcriber
 
 **Created**: 2026-03-21
-**Status**: In progress
+**Status**: PAUSED — separate channels pipeline is higher priority
+
+## Completed So Far
+- [x] Phase 0: Rich installed, ui.py created, speaker prompt fixed
+- [x] Phase 1: All 15 manual boxes migrated to Rich Panel/Table
+- [x] Phase 2a-b: RecordingDisplay with waveform (cmd_record)
+- [x] Phase 3: ProgressTracker rewritten with Rich Live
+- [x] Pause recording (P key) with reusable raw_keys()/poll_key()
+- [x] Auto-open Finder after transcription
+- [x] Save source audio config (audio.keep_recording)
+- [x] System health warnings (CPU/RAM at 85%)
+- [x] Code cleanup: removed LivePanel (220 lines), BlackHole legacy (120 lines), dead code
+- [x] Models trimmed to 5 (removed tiny, base, medium.en, large-v3.en)
+- [x] README updated for ScreenCaptureKit, new models, diarization/denoise clarification
+
+## Remaining (on pause)
+- [ ] Phase 2c: Wire cmd_live to RecordingDisplay
+- [ ] Phase 5: Calendar meeting info (--title, --end-time from cmd_watch)
+- [ ] Phase 6: Calendar attendee names (extend AppleScript)
 
 ## Overview
 

@@ -679,16 +679,7 @@ def clear_line():
     sys.stdout.flush()
 
 
-def format_duration(seconds):
-    """Format seconds as HH:MM:SS or MM:SS."""
-    if seconds < 0:
-        return "--:--"
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+from ui import format_duration  # shared with ui.py
 
 
 def level_meter(rms, width=20):

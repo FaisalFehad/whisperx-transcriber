@@ -140,10 +140,8 @@ def _quality_indicator(rms):
         return "[red]● Silent[/red]"
 
 
-def _format_duration(seconds):
+def format_duration(seconds):
     """Format seconds as MM:SS or HH:MM:SS."""
-    # NOTE: intentionally duplicated from transcriber.format_duration()
-    # to keep ui.py independently importable without circular imports.
     if seconds < 0:
         return "--:--"
     h = int(seconds // 3600)
@@ -186,7 +184,7 @@ class RecordingDisplay:
         if not paused:
             self._rms_history.append(rms)
 
-        time_str = _format_duration(elapsed)
+        time_str = format_duration(elapsed)
 
         if paused:
             parts = [f"  [yellow]⏸ {time_str}  PAUSED[/yellow]  [dim](P to resume)[/dim]"]
