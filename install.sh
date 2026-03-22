@@ -91,16 +91,12 @@ else
     echo "     4. Add to your shell: echo 'export HF_TOKEN=your_token' >> $SHELL_RC"
 fi
 
-# ─── Check BlackHole ─────────────────────────────────────────────────────────
+# ─── System Audio (ScreenCaptureKit) ─────────────────────────────────────────
 
 echo ""
-if system_profiler SPAudioDataType 2>/dev/null | grep -qi "blackhole"; then
-    echo "  ✅ BlackHole audio driver detected"
-else
-    echo "  ⚠  BlackHole not installed (needed for recording Zoom/Teams audio)"
-    echo "     Install with: brew install blackhole-2ch"
-    echo "     Then reboot and run: transcribe setup"
-fi
+echo "  ℹ  System audio capture uses ScreenCaptureKit (macOS 12.3+)"
+echo "     On first recording, macOS will prompt for Screen Recording permission"
+echo "     No BlackHole or virtual audio driver needed"
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 

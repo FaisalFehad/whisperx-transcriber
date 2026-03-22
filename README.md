@@ -18,18 +18,21 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 ### Transcription
 - **Parakeet CTC engine** — default model that cannot hallucinate (no "Thank Thank Thank..." on silence)
 - **Proper punctuation and capitalization** — out of the box, no post-processing needed
-- **Whisper fallback** — 5 Whisper models available for non-English or low-RAM setups
+- **Whisper fallback** — 4 Whisper models available for multilingual or low-RAM setups
 - **Spectral subtraction denoising** — automatic background noise removal for Whisper models
 - **Hallucination protection** — silence threshold detection skips fake text in Whisper output
-- **99 languages** — via Whisper models (Parakeet is English-only)
+- **99 languages** — via Whisper models (Parakeet supports English + 25 European languages)
 - **Multiple formats** — MP3, WAV, M4A, OGG, FLAC, WebM
 
 ### Recording
-- **System audio + mic** — captures both sides of Zoom, Teams, Meet, and other calls via BlackHole
+- **System audio + mic** — captures both sides of Zoom, Teams, Meet via ScreenCaptureKit (no BlackHole needed)
+- **No virtual devices** — volume keys work normally, no Audio MIDI Setup configuration
 - **Live mode** — transcribe during the call so the transcript is ready when you hang up
+- **Pause/resume** — press P to pause recording (audio is discarded while paused)
 - **Silence detection** — auto-stops recording when the meeting ends or audio goes quiet
 - **Adaptive scaling** — live mode adjusts chunk size and frequency based on system load
-- **Audio level indicators** — green/yellow/red display for mic and system audio during recording
+- **Waveform display** — live unicode waveform with quality indicators during recording
+- **System health monitoring** — warns when CPU or RAM usage exceeds 85%
 
 ### Speaker Identification
 - **Speaker diarization** — identifies who said what using Sortformer (GPU) or pyannote (CPU)
@@ -59,7 +62,7 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.10+
 - ffmpeg (`brew install ffmpeg`)
-- [BlackHole](https://github.com/ExistentialAudio/BlackHole) for system audio capture (optional — only needed for Zoom/Teams recording)
+- Screen Recording permission (macOS prompts on first use — needed for system audio capture via ScreenCaptureKit)
 
 ## Install
 
@@ -89,15 +92,11 @@ Speaker identification requires a free Hugging Face token:
 
 ### Audio Setup (for system audio capture)
 
-To capture audio from Zoom, Teams, or other apps, you need BlackHole:
+System audio capture uses **ScreenCaptureKit** (macOS 12.3+) — no virtual audio driver needed. On first use, macOS will prompt for Screen Recording permission:
 
-```bash
-brew install blackhole-2ch
-# Reboot your Mac
-transcribe setup    # Follow the guided setup
-```
+**System Settings → Privacy & Security → Screen Recording** → enable your terminal app.
 
-The setup guide walks you through creating a Multi-Output Device in Audio MIDI Setup so both you and BlackHole receive the call audio.
+That's it. No BlackHole, no Multi-Output Device, no Audio MIDI Setup. Volume keys work normally.
 
 ## Usage
 
@@ -212,15 +211,15 @@ Filter which calendars to watch in `config.json`.
 
 The default model is **Parakeet TDT 0.6B** — a CTC-based model from NVIDIA NeMo. Whisper models are available as alternatives.
 
-| Model | Type | Speed | Size | Notes |
-|-------|------|-------|------|-------|
-| **parakeet** | **CTC** | **~17x RT** | **~2.5GB** | **Default — best accuracy, no hallucinations** |
-| small.en | Whisper | ~16x RT | ~460MB | Low RAM alternative |
-| turbo | Whisper | ~12x RT | ~1.6GB | Good for technical jargon |
-| medium.en | Whisper | ~8x RT | ~1.5GB | Higher accuracy Whisper |
-| large-v3 | Whisper | ~4x RT | ~3GB | Highest accuracy Whisper |
+| Model | Type | Speed | Size | Denoise | Notes |
+|-------|------|-------|------|---------|-------|
+| **parakeet** | **CTC** | **~17x RT** | **~2.5GB** | **not needed** | **Default — best accuracy + speed, no hallucinations** |
+| small.en | Whisper | ~16x RT | ~460MB | auto | Fast, low RAM, English-only |
+| medium | Whisper | ~8x RT | ~1.5GB | auto | Balanced, multilingual (99 languages) |
+| turbo | Whisper | ~12x RT | ~1.6GB | auto | Fast + accurate, multilingual |
+| large-v3 | Whisper | ~4x RT | ~3GB | auto | Most capable Whisper (slow, high RAM) |
 
-Speed measured on M1 16GB. RT = realtime (17x means a 1-hour file transcribes in ~3.5 min).
+Speed measured on M1 16GB. RT = realtime (17x means a 1-hour file transcribes in ~3.5 min). Speaker diarization is enabled by default for all models. Denoising is automatic for Whisper models (Parakeet's CTC architecture handles noise natively).
 
 ### Why Parakeet over Whisper?
 
@@ -230,7 +229,9 @@ Parakeet also produces properly punctuated, capitalized text out of the box.
 
 ### Accuracy
 
-Evaluated on a 37-minute recording (4 speakers, background noise, ~60s silence at start). Scored independently by two human evaluators listening to the reference audio. All times on M1 16GB.
+**Speaker diarization** (who said what) is enabled by default for all models — not just Parakeet. Disable with `--no-diarize` for faster processing without speaker labels.
+
+Evaluated on a 37-minute recording (4 speakers, background noise, ~60s silence at start). Scored independently by two human evaluators listening to the reference audio. All times on M1 16GB. Diarization was tested with Parakeet (rows 1-2); Whisper rows were tested without diarization to isolate transcription quality.
 
 | Rank | Score /10 | Model | Speed | Hallucinations | Stability | Notes |
 |------|-----------|-------|-------|----------------|-----------|-------|
@@ -252,7 +253,7 @@ Evaluated on a 37-minute recording (4 speakers, background noise, ~60s silence a
 |----------|-------|-----|
 | **General use** | `parakeet` (default) | Best accuracy, no hallucinations, always stable |
 | **Low RAM (< 8GB free)** | `small.en` | Only 460MB vs 2.5GB |
-| **Non-English** | `small` or `turbo` | Parakeet is English-only |
+| **Non-English** | `medium` or `turbo` | 99 languages via Whisper |
 | **Technical jargon** | `turbo` | Larger vocabulary, but needs denoising |
 
 When using Whisper models, hallucination mitigation is enabled by default (silence threshold + spectral subtraction denoising). Disable denoising with `--no-denoise`.
@@ -308,7 +309,7 @@ Any value you omit uses the built-in default.
 | Key | Default | What it does |
 |-----|---------|--------------|
 | `engine` | `"mlx"` | `"mlx"` runs on Apple GPU (fast). `"whisperx"` runs on CPU (compatible with any machine) |
-| `default_model` | `"parakeet"` | Which model to use. `"parakeet"` for best accuracy, or any Whisper model (`"small.en"`, `"turbo"`, `"medium.en"`, `"large-v3"`) |
+| `default_model` | `"parakeet"` | Which model to use. `"parakeet"` for best accuracy, or Whisper: `"small.en"`, `"medium"`, `"turbo"`, `"large-v3"` |
 | `language` | `"en"` | Language code. Set explicitly to avoid misdetection. [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
 | `user_name` | `""` | Your name — used in speaker recognition to label your voice in transcripts |
 | `auto_title_from_calendar` | `true` | When recording during a calendar event, use the event name as the transcript title |
@@ -385,7 +386,7 @@ Controls who-said-what detection.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `watch.model` | `"small"` | Model to use for auto-transcription after a watched recording finishes |
+| `watch.model` | `"parakeet"` | Model to use for auto-transcription after a watched recording finishes |
 | `watch.calendars` | `[]` | Only watch these calendar names. Empty = watch all calendars |
 | `watch.silence_timeout_minutes` | `10` | Stop auto-recording after this many minutes of silence |
 | `watch.min_recording_minutes` | `2` | Discard auto-recordings shorter than this. Catches non-meeting calendar events |
@@ -398,7 +399,7 @@ Controls who-said-what detection.
 Per-model batch sizes for the WhisperX CPU engine (higher = faster, more RAM). Tuned for M1 16GB:
 
 ```json
-"batch_sizes": { "tiny": 32, "base": 24, "small": 16, "medium": 8, "large-v3": 4 }
+"batch_sizes": { "small.en": 16, "medium": 8, "turbo": 4, "large-v3": 4 }
 ```
 
 Reduce if you get memory errors. Increase on machines with more RAM. Not used by the MLX engine.
@@ -407,11 +408,11 @@ Reduce if you get memory errors. Increase on machines with more RAM. Not used by
 
 **"No audio recorded"** — Check that your mic is working: `transcribe setup`
 
-**BlackHole not capturing system audio** — You need a Multi-Output Device in Audio MIDI Setup. Run `transcribe setup` for step-by-step instructions. Reboot after installing BlackHole.
+**System audio not captured** — Grant Screen Recording permission: System Settings → Privacy & Security → Screen Recording → enable your terminal app.
 
 **Speaker diarization not working** — Make sure `HF_TOKEN` is set and you've accepted the model terms on Hugging Face (see install instructions above).
 
-**Live mode too slow** — The adaptive system handles this automatically. You can also use a smaller model (`-m tiny`) or increase `live.chunk_interval_seconds`.
+**Live mode too slow** — The adaptive system handles this automatically. You can also use a smaller model (`-m small.en`) or increase `live.chunk_interval_seconds`.
 
 **Calendar watch doesn't see my meetings** — Make sure macOS Calendar has permission to be accessed by Terminal: `osascript -e 'tell application "Calendar" to return name of every calendar'`
 

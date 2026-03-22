@@ -18,16 +18,12 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"  # suppress tqdm "Fetching N fi
 import argparse
 import gc
 import json
-import os
 import re
-import select
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
-import tty
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -78,9 +74,7 @@ DEFAULT_CONFIG = {
     # Higher = faster but more RAM. These are tuned for M1 16GB.
     # Reduce if you get memory errors; increase on machines with more RAM.
     "batch_sizes": {
-        "tiny": 32, "tiny.en": 32, "base": 24, "base.en": 24,
-        "small": 16, "small.en": 16, "medium": 8, "medium.en": 8,
-        "turbo": 4, "large-v3": 4, "large-v3.en": 4
+        "small.en": 16, "medium": 8, "turbo": 4, "large-v3": 4
     },
 
     # ── File paths ───────────────────────────────────────────────────────
@@ -101,11 +95,14 @@ DEFAULT_CONFIG = {
         "silence_threshold": 0.005,
         # Minutes of continuous silence before auto-stopping recording
         "silence_timeout_minutes": 10,
-        # Virtual audio device name for system audio capture
-        # Change if using BlackHole 16ch or another virtual driver
-        "blackhole_device": "BlackHole 2ch",
         # Seconds of low mic level before showing warning
         "mic_low_warning_seconds": 10,
+    },
+
+    # Audio file management after transcription
+    "audio": {
+        # Keep the source WAV after successful transcription (True) or delete it (False)
+        "keep_recording": True,
     },
 
     # Accepted audio file types for transcription and listing
@@ -231,35 +228,21 @@ DEFAULT_CONFIG = {
     # speed_factor: multiplier for time estimation (audio_duration × factor)
     # Lower = faster model. These are calibrated for M1 Apple Silicon.
     "models": {
-        "tiny":     {"speed_factor": 0.1,  "description": "fastest, least accurate",       "size": "~75MB"},
-        "tiny.en":  {"speed_factor": 0.1,  "description": "fastest, English-only",        "size": "~75MB"},
-        "base":     {"speed_factor": 0.2,  "description": "fast, good for clear audio",   "size": "~140MB"},
-        "base.en":  {"speed_factor": 0.2,  "description": "fast, English-only",           "size": "~140MB"},
-        "small":    {"speed_factor": 0.5,  "description": "balanced, multilingual",       "size": "~460MB"},
-        "small.en": {"speed_factor": 0.5,  "description": "balanced, English-only (recommended)", "size": "~460MB"},
-        "medium":   {"speed_factor": 1.5,  "description": "slow, multilingual",           "size": "~1.5GB"},
-        "medium.en":{"speed_factor": 1.5,  "description": "slow, English-only",           "size": "~1.5GB"},
-        "turbo":    {"speed_factor": 0.8,  "description": "fast + accurate (best value)", "size": "~1.6GB"},
-        "large-v3": {"speed_factor": 4.0,  "description": "slowest, most accurate",      "size": "~3GB"},
-        "large-v3.en": {"speed_factor": 4.0, "description": "most accurate, English-only", "size": "~3GB"},
-        "parakeet":     {"speed_factor": 0.5, "description": "CTC — no hallucinations, best accuracy", "size": "~2.5GB"},
+        "parakeet":  {"speed_factor": 0.5, "description": "best accuracy + speed, no hallucinations ★", "size": "~2.5GB"},
+        "small.en":  {"speed_factor": 0.5, "description": "fast, low RAM, English-only",               "size": "~460MB"},
+        "medium":    {"speed_factor": 1.5, "description": "balanced, multilingual (99 languages)",      "size": "~1.5GB"},
+        "turbo":     {"speed_factor": 0.8, "description": "fast + accurate, multilingual",              "size": "~1.6GB"},
+        "large-v3":  {"speed_factor": 4.0, "description": "most capable Whisper (slow, high RAM)",      "size": "~3GB"},
     },
 
     # ── MLX model repos (HuggingFace) ────────────────────────────────
     # Maps model names to mlx-community HF repos (auto-downloaded on first use)
     "mlx_models": {
-        "tiny":      "mlx-community/whisper-tiny-mlx",
-        "tiny.en":   "mlx-community/whisper-tiny.en-mlx",
-        "base":      "mlx-community/whisper-base-mlx",
-        "base.en":   "mlx-community/whisper-base.en-mlx",
-        "small":     "mlx-community/whisper-small-mlx",
+        "parakeet":  "mlx-community/parakeet-tdt-0.6b-v3",
         "small.en":  "mlx-community/whisper-small.en-mlx",
         "medium":    "mlx-community/whisper-medium-mlx",
-        "medium.en": "mlx-community/whisper-medium.en-mlx",
-        "turbo":      "mlx-community/whisper-large-v3-turbo",
-        "large-v3":   "mlx-community/whisper-large-v3-mlx",
-        "large-v3.en":"mlx-community/whisper-large-v3-mlx",
-        "parakeet":   "mlx-community/parakeet-tdt-0.6b-v3",
+        "turbo":     "mlx-community/whisper-large-v3-turbo",
+        "large-v3":  "mlx-community/whisper-large-v3-mlx",
     },
 }
 
@@ -301,8 +284,7 @@ SILENCE_THRESHOLD = config["recording"]["silence_threshold"]
 SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 
 AUDIO_FORMATS = tuple(config["audio_formats"])
-BLACKHOLE_DEVICE_NAME = config["recording"]["blackhole_device"]
-VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")
+VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")  # filtered from mic selection
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 DEVICE = config.get("device", "cpu")
 ENGINE = config.get("engine", "mlx")
@@ -761,243 +743,6 @@ def adaptive_batch_size(batch_size, model_name):
         return batch_size, None  # plenty of RAM
 
 
-def quality_label(rms):
-    """Return audio quality label based on RMS level."""
-    if rms > 0.1:
-        return "Hot!  "
-    elif rms > 0.02:
-        return "Good  "
-    elif rms > 0.005:
-        return "Low   "
-    elif rms > 0.001:
-        return "Quiet "
-    else:
-        return "Silent"
-
-
-# ─── Live Panel ──────────────────────────────────────────────────────────────
-
-class LivePanel:
-    """Interactive terminal UI with keyboard controls for live recording."""
-
-    HELP_TEXT = [
-        "  ┌─── Keyboard Shortcuts ──────────────────────┐",
-        "  │  [Space]  Pause / Resume transcription       │",
-        "  │  [b]      Drop bookmark at current time      │",
-        "  │  [!]      Flag moment for review             │",
-        "  │  [+]      Increase chunk frequency           │",
-        "  │  [-]      Decrease chunk frequency           │",
-        "  │  [i]      Toggle info panel                  │",
-        "  │  [c]      Show recent transcript             │",
-        "  │  [n]      Name a speaker                     │",
-        "  │  [q]      Stop recording                     │",
-        "  │  [?]      Toggle this help                   │",
-        "  └──────────────────────────────────────────────┘",
-    ]
-
-    def __init__(self, source_label, mic_name, bh_name, model_name,
-                 model_info, adaptive, output_path, silence_timeout):
-        self.source_label = source_label
-        self.mic_name = mic_name
-        self.bh_name = bh_name or "N/A"
-        self.model_name = model_name
-        self.model_size = model_info.get("size", "?")
-        self.adaptive = adaptive
-        self.output_path = output_path
-        self.silence_timeout = silence_timeout
-
-        self.paused = False
-        self.show_info = True
-        self.show_help = False
-        self.show_transcript = False
-        self.bookmarks = []
-        self.flags = []
-        self.speaker_names_override = []
-        self.should_stop = False
-        self._low_mic_since = None  # track sustained low mic
-
-        self._prev_line_count = 0
-        self._old_term = None
-        self._raw = False
-
-    def start(self):
-        """Enter cbreak mode for single-char key reads."""
-        try:
-            self._old_term = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-            self._raw = True
-            sys.stdout.write("\033[?25l")  # hide cursor
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-    def stop(self):
-        """Restore terminal to normal mode."""
-        sys.stdout.write("\033[?25h\n")  # show cursor
-        sys.stdout.flush()
-        if self._old_term:
-            try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_term)
-            except Exception:
-                pass
-        self._raw = False
-
-    def poll_key(self):
-        """Non-blocking single key read. Returns key char or None."""
-        if not self._raw:
-            return None
-        try:
-            if select.select([sys.stdin], [], [], 0)[0]:
-                return sys.stdin.read(1)
-        except Exception:
-            pass
-        return None
-
-    def handle_key(self, key, elapsed):
-        """Process a keypress."""
-        if key == ' ':
-            self.paused = not self.paused
-        elif key == 'q':
-            self.should_stop = True
-        elif key == 'b':
-            self.bookmarks.append(elapsed)
-        elif key == '!':
-            self.flags.append(elapsed)
-        elif key == 'i':
-            self.show_info = not self.show_info
-            self._prev_line_count = 0  # force full redraw
-        elif key == 'c':
-            self.show_transcript = not self.show_transcript
-            self._prev_line_count = 0
-        elif key == '?':
-            self.show_help = not self.show_help
-            self._prev_line_count = 0
-        elif key == '+':
-            self.adaptive["interval"] = max(
-                self.adaptive["min_interval"],
-                self.adaptive["interval"] - 30
-            )
-        elif key == '-':
-            self.adaptive["interval"] = min(
-                self.adaptive["max_interval"],
-                self.adaptive["interval"] + 30
-            )
-        elif key == 'n':
-            self._input_speaker_name()
-
-    def _input_speaker_name(self):
-        """Switch to cooked mode for text input, then back to cbreak."""
-        if self._old_term:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_term)
-        sys.stdout.write("\033[?25h")  # show cursor
-        try:
-            name = input("\n  Speaker name (Enter to cancel): ").strip()
-            if name:
-                self.speaker_names_override.append(name)
-                print(f"  ✅ '{name}' will be applied to transcript")
-                time.sleep(0.5)
-        except (EOFError, KeyboardInterrupt):
-            pass
-        finally:
-            sys.stdout.write("\033[?25l")
-            if self._old_term:
-                tty.setcbreak(sys.stdin.fileno())
-        self._prev_line_count = 0  # force full redraw
-
-    def render(self, elapsed, mic_rms, bh_rms, silence_elapsed,
-              chunks_done, chunk_in_progress, adaptive,
-              transcribed_segments, rec_size_bytes):
-        """Render the live control panel to terminal."""
-        lines = []
-
-        # ── Header ─────────────────────────────────────────
-        time_str = format_duration(elapsed)
-        pause_tag = "  ⏸ PAUSED" if self.paused else ""
-        rec_only_tag = "  ⚠ REC ONLY" if adaptive.get("rec_only") else ""
-
-        lines.append("  ┌─────────────────────────────────────────────────────┐")
-        tag = f"{pause_tag}{rec_only_tag}"
-        lines.append(f"  │  🎙  Live  {time_str}{tag:<32} [?]  │")
-        lines.append("  ├─────────────────────────────────────────────────────┤")
-
-        # ── Audio quality meters ───────────────────────────
-        mic_meter = level_meter(mic_rms, width=12)
-        mic_qual = quality_label(mic_rms)
-        sil_str = f"Sil: {format_duration(silence_elapsed)}/{format_duration(self.silence_timeout)}"
-        lines.append(f"  │  🎙  {mic_meter} {mic_qual} {sil_str:<20}│")
-
-        if bh_rms is not None:
-            bh_meter = level_meter(bh_rms, width=12)
-            bh_qual = quality_label(bh_rms)
-            bh_label = self.bh_name[:19]
-            lines.append(f"  │  🔊  {bh_meter} {bh_qual} ({bh_label:<19})│")
-
-        # ── Audio quality warning ──────────────────────────
-        if mic_rms < 0.001:
-            if self._low_mic_since is None:
-                self._low_mic_since = time.time()
-            elif time.time() - self._low_mic_since > 10:
-                lines.append("  │  ⚠  Mic very low — check connection!              │")
-        else:
-            self._low_mic_since = None
-
-        # ── Info panel (toggle with 'i') ───────────────────
-        if self.show_info:
-            chunk_str = f"Chunks: {chunks_done}"
-            if chunk_in_progress:
-                chunk_str += " ⟳"
-            if adaptive.get("rec_only"):
-                chunk_str = "REC only"
-
-            interval_str = f"Every {adaptive['interval']}s"
-            batch_str = f"Batch: {adaptive['batch_size']}"
-            size_mb = rec_size_bytes / (1024 * 1024) if rec_size_bytes else 0
-
-            lines.append(f"  │  📊  {self.model_name} {self.model_size:<8}│ {batch_str:<10}│ {interval_str:<9}│")
-            lines.append(f"  │  💾  {size_mb:>5.1f}MB recorded  │ {chunk_str:<23}│")
-
-            # Bookmarks & flags
-            markers = []
-            if self.bookmarks:
-                markers.append(f"📌 {len(self.bookmarks)} bookmarks")
-            if self.flags:
-                markers.append(f"⚠️  {len(self.flags)} flags")
-            if markers:
-                marker_str = "  ".join(markers)
-                lines.append(f"  │  {marker_str:<50}│")
-
-        lines.append("  └─────────────────────────────────────────────────────┘")
-
-        # ── Help panel ─────────────────────────────────────
-        if self.show_help:
-            for help_line in self.HELP_TEXT:
-                lines.append(help_line)
-
-        # ── Recent transcript (toggle with 'c') ───────────
-        if self.show_transcript and transcribed_segments:
-            lines.append("  ── Recent transcript ──────────────────────────────")
-            recent = transcribed_segments[-5:]
-            for seg in recent:
-                ts = format_duration(seg.get("start", 0))
-                text = seg.get("text", "").strip()
-                if len(text) > 50:
-                    text = text[:47] + "..."
-                spk = seg.get("speaker", "?")
-                lines.append(f"  [{ts}] {spk}: {text}")
-            lines.append("")
-
-        # ── Render to terminal (overwrite previous) ────────
-        if self._prev_line_count > 0:
-            sys.stdout.write(f"\033[{self._prev_line_count}A")
-
-        output = ""
-        for line in lines:
-            output += f"\033[K{line}\n"
-
-        sys.stdout.write(output)
-        sys.stdout.flush()
-        self._prev_line_count = len(lines)
-
 
 # ─── Audio Device Detection ───────────────────────────────────────────────────
 
@@ -1029,158 +774,38 @@ def get_default_mic():
     return airpods_result or fallback_result or (None, "Unknown")
 
 
-def find_blackhole():
-    """Check if BlackHole is available."""
-    import sounddevice as sd
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and BLACKHOLE_DEVICE_NAME in d["name"]:
-            return i, d["name"]
-    return None, None
-
-
-def find_audio_device():
-    """
-    Find the best recording input.
-    Returns: (blackhole_id, mic_id, mic_name)
-    """
-    bh_id, _ = find_blackhole()
-    mic_id, mic_name = get_default_mic()
-
-    if bh_id is not None:
-        if mic_name and BLACKHOLE_DEVICE_NAME in mic_name:
-            import sounddevice as sd
-            for i, d in enumerate(sd.query_devices()):
-                if (d["max_input_channels"] > 0
-                        and BLACKHOLE_DEVICE_NAME not in d["name"]
-                        and "Aggregate" not in d["name"]
-                        and "Multi-Output" not in d["name"]):
-                    mic_id, mic_name = i, d["name"]
-                    break
-        return bh_id, mic_id, mic_name
-
-    if not _SCK_AVAILABLE:
-        print("  ⚠  BlackHole not installed — recording from mic only.")
-        print("     Zoom/Teams audio won't be captured.")
-        print("     Install with: brew install blackhole-2ch && reboot")
-        print()
-    return None, mic_id, mic_name
-
-
-# ─── Audio Routing & Volume ──────────────────────────────────────────────────
-
-def find_multi_output_device():
-    """Find a Multi-Output Device in the output device list (for BlackHole routing)."""
-    import sounddevice as sd
-    for d in sd.query_devices():
-        if d["max_output_channels"] > 0 and "Multi-Output" in d["name"]:
-            return d["name"]
-    return None
-
-
-def get_current_output_device():
-    """Get current system audio output device name via SwitchAudioSource."""
-    result = subprocess.run(
-        ["SwitchAudioSource", "-c", "-t", "output"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip()
-
-
-def set_output_device(device_name):
-    """Set system audio output device by name via SwitchAudioSource."""
-    subprocess.run(
-        ["SwitchAudioSource", "-s", device_name, "-t", "output"],
-        capture_output=True, check=True,
-    )
-
-
-def get_system_volume():
-    """Get current system output volume (0–100)."""
-    result = subprocess.run(
-        ["osascript", "-e", "get volume settings"],
-        capture_output=True, text=True, check=True,
-    )
-    parts = result.stdout.strip().split(",")[0]
-    return int(parts.split(":")[1].strip())
-
-
-def set_system_volume(percent):
-    """Set system output volume (0–100). Works even when Multi-Output Device is active."""
-    percent = max(0, min(100, int(percent)))
-    subprocess.run(
-        ["osascript", "-e", f"set volume output volume {percent}"],
-        check=True,
-    )
-
-
-def _route_to_multi_output():
-    """Switch system output to Multi-Output Device for BlackHole capture.
-
-    Returns the previous device name so it can be restored, or None if no
-    switch was made (already on Multi-Output, or SwitchAudioSource not installed).
-    """
-    target = find_multi_output_device()
-    if not target:
-        return None
-    try:
-        current = get_current_output_device()
-        if current and current != target:
-            set_output_device(target)
-            return current
-    except FileNotFoundError:
-        pass  # SwitchAudioSource not installed — silent skip
-    except Exception:
-        pass
-    return None
-
-
-def _restore_output(previous):
-    """Restore system output to a previously saved device name. No-op if None."""
-    if previous:
-        try:
-            set_output_device(previous)
-        except Exception:
-            pass
 
 
 def cmd_setup(args):
     """Check audio setup status."""
     import sounddevice as sd
 
-    bh_id, _ = find_blackhole()
     mic_id, mic_name = get_default_mic()
+    sck_status = "✅ ScreenCaptureKit (system audio)" if _SCK_AVAILABLE else "❌ pip install pyobjc-framework-ScreenCaptureKit"
 
     from ui import info_panel
-    bh_status = "✅ System audio capture" if bh_id is not None else "❌ Not installed (brew install blackhole-2ch)"
     print()
     info_panel("🔧 Audio Setup", [
-        ("BlackHole:", bh_status),
+        ("System:", sck_status),
         ("Mic:", mic_name),
     ])
 
-    if bh_id is not None:
+    if _SCK_AVAILABLE:
         print()
-        print("  ✅ Ready! The script auto-captures system audio + mic.")
-        print("     No manual Audio MIDI Setup needed.")
+        print("  ✅ Ready! System audio is captured via ScreenCaptureKit.")
+        print("     No virtual audio drivers needed.")
+        print("     Volume keys work normally.")
+    else:
         print()
-        print("  Before a Zoom/Teams call, set your Mac sound output to")
-        print("  include BlackHole so the script can capture it:")
-        print()
-        print("  1. Open 'Audio MIDI Setup' (Spotlight → Audio MIDI)")
-        print("  2. Click '+' → 'Create Multi-Output Device'")
-        print("  3. Check: your speakers/earphones + BlackHole 2ch")
-        print("  4. System Settings → Sound → Output → Multi-Output Device")
-        print()
-        print("  This only needs to be done once. After that, just:")
-        print("     transcribe rec")
+        print("  ⚠  System audio not available. Only mic will be recorded.")
+        print("     To capture Zoom/Teams audio:")
+        print("     pip install pyobjc-framework-ScreenCaptureKit")
 
     print()
     print("  Input devices:")
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] > 0:
             markers = []
-            if BLACKHOLE_DEVICE_NAME in d["name"]:
-                markers.append("system audio")
             if i == mic_id:
                 markers.append("active mic")
             tag = f" ← {', '.join(markers)}" if markers else ""
@@ -1197,7 +822,7 @@ def cmd_record(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    _, mic_id, mic_name = find_audio_device()
+    mic_id, mic_name = get_default_mic()
     dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
 
@@ -1209,13 +834,14 @@ def cmd_record(args):
     info_panel("🎙 Recording", [
         ("Source:", source_label),
         ("Silence:", f"Auto-stops after {SILENCE_TIMEOUT // 60}min"),
-        ("Controls:", "Ctrl+C to stop"),
+        ("Controls:", "P = pause, Ctrl+C = stop"),
     ])
     print()
 
     mic_frames = []
-    bh_frames = []
+    sys_frames = []
     recording = True
+    paused = False
     silence_start = None
     current_rms = 0.0
     start_time = time.time()
@@ -1225,6 +851,8 @@ def cmd_record(args):
         nonlocal silence_start, current_rms, recording
         if not recording:
             raise sd.CallbackAbort()
+        if paused:
+            return  # discard audio while paused
         mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
         with lock:
             mic_frames.append(mono.copy())
@@ -1238,17 +866,19 @@ def cmd_record(args):
             else:
                 silence_start = None
 
-    def bh_callback(indata, frame_count, time_info, status):
+    def sys_callback(indata, frame_count, time_info, status):
         nonlocal silence_start, current_rms
         if not recording:
             raise sd.CallbackAbort()
+        if paused:
+            return  # discard audio while paused
         mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
         with lock:
-            bh_frames.append(mono.copy())
-            bh_rms = float(np.sqrt(np.mean(mono ** 2)))
-            if bh_rms > SILENCE_THRESHOLD:
+            sys_frames.append(mono.copy())
+            sys_rms = float(np.sqrt(np.mean(mono ** 2)))
+            if sys_rms > SILENCE_THRESHOLD:
                 silence_start = None
-                current_rms = max(current_rms, bh_rms)
+                current_rms = max(current_rms, sys_rms)
 
     blocksize = int(SAMPLE_RATE * 0.5)
 
@@ -1259,22 +889,30 @@ def cmd_record(args):
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
-            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=bh_callback)
+            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=sys_callback)
         except RuntimeError as e:
             print(f"  ⚠  System audio unavailable: {e}")
             dual_mode = False
 
-    from ui import RecordingDisplay
+    from ui import RecordingDisplay, raw_keys, poll_key, check_system_health
 
     auto_stopped = False
     display = RecordingDisplay()
+    last_health_check = 0
     try:
         mic_stream.start()
         if sck_capture:
             sck_capture.start()
         mic_low_since_rec = None
-        with display:
+        with raw_keys(), display:
             while recording:
+                # Handle keyboard
+                key = poll_key()
+                if key == "p":
+                    paused = not paused
+                    if paused:
+                        silence_start = None  # don't count pause as silence
+
                 with lock:
                     rms = current_rms
                     sil = silence_start
@@ -1282,17 +920,27 @@ def cmd_record(args):
                 elapsed = time.time() - start_time
                 silence_elapsed = time.time() - sil if sil else 0
 
-                # Mic low warning
-                if rms < 0.001:
+                # Warnings: mic low + system health
+                warning = None
+                if not paused and rms < 0.001:
                     if mic_low_since_rec is None:
                         mic_low_since_rec = time.time()
                     elif time.time() - mic_low_since_rec > MIC_LOW_WARNING_SECONDS:
-                        display.set_warning("Mic very low!")
+                        warning = "Mic very low!"
                 else:
                     mic_low_since_rec = None
-                    display.set_warning(None)
 
-                display.update(rms, elapsed, silence_elapsed)
+                # Check system health every 30s
+                now = time.time()
+                if now - last_health_check > 30:
+                    last_health_check = now
+                    health = check_system_health()
+                    if health:
+                        warning = health if not warning else f"{warning} │ {health}"
+
+                display.set_warning(warning)
+
+                display.update(rms, elapsed, silence_elapsed, paused=paused)
                 time.sleep(0.25)
 
         auto_stopped = True
@@ -1310,7 +958,7 @@ def cmd_record(args):
         print("  ⚠  No audio recorded.")
         return
 
-    audio_data = _mix_audio(mic_frames, bh_frames, dual_mode)
+    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode)
     saved_to = _safe_write_audio(output_path, audio_data, SAMPLE_RATE, description="recording")
     if saved_to:
         output_path = saved_to
@@ -1330,17 +978,17 @@ def cmd_record(args):
     prompt_transcribe(str(output_path))
 
 
-def _mix_audio(mic_frames, bh_frames, dual_mode):
+def _mix_audio(mic_frames, sys_frames, dual_mode):
     """Mix mic + system audio into mono. Returns numpy array."""
     if not mic_frames:
         return np.array([], dtype=np.float32)
     mic_audio = np.concatenate(mic_frames)
-    if dual_mode and bh_frames:
-        bh_audio = np.concatenate(bh_frames)
-        min_len = min(len(mic_audio), len(bh_audio))
+    if dual_mode and sys_frames:
+        sys_audio = np.concatenate(sys_frames)
+        min_len = min(len(mic_audio), len(sys_audio))
         mic_audio = mic_audio[:min_len]
-        bh_audio = bh_audio[:min_len]
-        return (mic_audio + bh_audio) / 2.0
+        sys_audio = sys_audio[:min_len]
+        return (mic_audio + sys_audio) / 2.0
     return mic_audio
 
 
@@ -1450,7 +1098,7 @@ def cmd_live(args):
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
-    _, mic_id, mic_name = find_audio_device()
+    mic_id, mic_name = get_default_mic()
     dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
 
@@ -1469,12 +1117,12 @@ def cmd_live(args):
 
     # ── Recording state ───────────────────────────────────────────────────
     mic_frames = []
-    bh_frames = []
+    sys_frames = []
     recording = True
     silence_start = None
     current_rms = 0.0
     mic_rms_val = 0.0
-    bh_rms_val = 0.0
+    sys_rms_val = 0.0
     mic_low_since = None  # timestamp when mic went quiet
     start_time = time.time()
     lock = threading.Lock()
@@ -1519,17 +1167,17 @@ def cmd_live(args):
             else:
                 silence_start = None
 
-    def bh_callback(indata, frame_count, time_info, status):
-        nonlocal silence_start, current_rms, bh_rms_val
+    def sys_callback(indata, frame_count, time_info, status):
+        nonlocal silence_start, current_rms, sys_rms_val
         if not recording:
             raise sd.CallbackAbort()
         mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
         with lock:
-            bh_frames.append(mono.copy())
-            bh_rms_val = float(np.sqrt(np.mean(mono ** 2)))
-            if bh_rms_val > SILENCE_THRESHOLD:
+            sys_frames.append(mono.copy())
+            sys_rms_val = float(np.sqrt(np.mean(mono ** 2)))
+            if sys_rms_val > SILENCE_THRESHOLD:
                 silence_start = None
-                current_rms = max(current_rms, bh_rms_val)
+                current_rms = max(current_rms, sys_rms_val)
 
     def _get_mixed_snapshot():
         """Get current mixed audio snapshot (copies frame lists under lock)."""
@@ -1537,10 +1185,10 @@ def cmd_live(args):
             if not mic_frames:
                 return None
             mic_copy = list(mic_frames)
-            bh_copy = list(bh_frames) if dual_mode else []
+            sys_copy = list(sys_frames) if dual_mode else []
         audio = np.concatenate(mic_copy).flatten()
-        if bh_copy:
-            bh = np.concatenate(bh_copy).flatten()
+        if sys_copy:
+            bh = np.concatenate(sys_copy).flatten()
             min_len = min(len(audio), len(bh))
             audio = (audio[:min_len] + bh[:min_len]) / 2.0
         return audio
@@ -1652,7 +1300,7 @@ def cmd_live(args):
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
-            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=bh_callback)
+            sck_capture = _SystemAudioCapture(sample_rate=SAMPLE_RATE, callback=sys_callback)
         except RuntimeError as e:
             print(f"  ⚠  System audio unavailable: {e}")
             dual_mode = False
@@ -1672,7 +1320,7 @@ def cmd_live(args):
                 rms = current_rms
                 sil = silence_start
                 m_rms = mic_rms_val
-                b_rms = bh_rms_val
+                b_rms = sys_rms_val
 
             elapsed = time.time() - start_time
             silence_elapsed = time.time() - sil if sil else 0
@@ -1768,7 +1416,7 @@ def cmd_live(args):
         print(f"  📊 {chunks_done} chunks pre-transcribed during recording")
 
     # ── Save audio file ───────────────────────────────────────────────────
-    audio_data = _mix_audio(mic_frames, bh_frames, dual_mode)
+    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode)
     saved_to = _safe_write_audio(output_path, audio_data, SAMPLE_RATE, description="recording")
     if saved_to:
         output_path = saved_to
@@ -1918,6 +1566,9 @@ def cmd_live(args):
             ("Saved to:", f"Scripts/{transcript_file.name}"),
         ])
         print()
+
+        # Open transcript folder in Finder
+        subprocess.run(["open", str(transcript_file.parent)], check=False)
 
         # Log run to history for benchmarking
         _log_run({
@@ -2581,6 +2232,16 @@ def cmd_run(args):
         print()
         success_panel("✅ Transcription complete!", rows)
         print()
+
+        # Open transcript folder in Finder
+        subprocess.run(["open", str(output_file.parent)], check=False)
+
+        # Delete source recording if configured
+        if not config.get("audio", {}).get("keep_recording", True):
+            try:
+                Path(audio_path).unlink()
+            except OSError:
+                pass
 
         # Log run to history for benchmarking
         step_log = {}

@@ -1,6 +1,11 @@
 """Shared Rich-based UI components for whisperx-transcriber."""
 
+import select
+import sys
+import termios
+import tty
 from collections import deque
+from contextlib import contextmanager
 
 from rich.console import Console
 from rich.live import Live
@@ -9,6 +14,42 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
+
+
+# ── Keyboard handling ─────────────────────────────────────────────────────────
+
+@contextmanager
+def raw_keys():
+    """Context manager for single-keypress input (no echo, no Enter needed).
+
+    Usage:
+        with raw_keys():
+            while True:
+                key = poll_key()
+                if key == "p":
+                    paused = not paused
+    """
+    if not sys.stdin.isatty():
+        yield
+        return
+    old = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        yield
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+
+def poll_key():
+    """Non-blocking single key read. Returns the key or None.
+
+    Must be called inside a raw_keys() context.
+    """
+    if not sys.stdin.isatty():
+        return None
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
 
 # Waveform block characters — 8 levels from silence to peak
 _WAVE_CHARS = " ▁▂▃▄▅▆▇"
@@ -53,6 +94,28 @@ def success_panel(title, rows):
     ))
 
 
+# ── System health ─────────────────────────────────────────────────────────────
+
+def check_system_health(threshold=85):
+    """Check CPU and RAM usage. Returns warning string or None.
+
+    On Apple Silicon, GPU memory IS system RAM (unified architecture),
+    so RAM monitoring effectively covers GPU memory too.
+    """
+    try:
+        import psutil
+        warnings = []
+        cpu = psutil.cpu_percent(interval=None)  # non-blocking (uses cached value)
+        ram = psutil.virtual_memory().percent
+        if cpu > threshold:
+            warnings.append(f"CPU {int(cpu)}%")
+        if ram > threshold:
+            warnings.append(f"RAM {int(ram)}%")
+        return " │ ".join(warnings) if warnings else None
+    except ImportError:
+        return None
+
+
 # ── Recording display ────────────────────────────────────────────────────────
 
 def _waveform(rms_history, width=24):
@@ -79,6 +142,8 @@ def _quality_indicator(rms):
 
 def _format_duration(seconds):
     """Format seconds as MM:SS or HH:MM:SS."""
+    # NOTE: intentionally duplicated from transcriber.format_duration()
+    # to keep ui.py independently importable without circular imports.
     if seconds < 0:
         return "--:--"
     h = int(seconds // 3600)
@@ -116,21 +181,22 @@ class RecordingDisplay:
         """Set a warning message (or None to clear)."""
         self._warnings = [msg] if msg else []
 
-    def update(self, rms, elapsed, silence_elapsed):
+    def update(self, rms, elapsed, silence_elapsed, paused=False):
         """Refresh the display with current audio state."""
-        self._rms_history.append(rms)
+        if not paused:
+            self._rms_history.append(rms)
 
-        wave = _waveform(self._rms_history)
-        quality = _quality_indicator(rms)
         time_str = _format_duration(elapsed)
-        silence_str = f"{int(silence_elapsed)}s" if silence_elapsed > 0 else ""
 
-        # Build the status line
-        parts = [f"  ⏺ {time_str}  {wave}  {quality}"]
-        if silence_str:
-            parts[0] += f"  [dim]silence {silence_str}[/dim]"
+        if paused:
+            parts = [f"  [yellow]⏸ {time_str}  PAUSED[/yellow]  [dim](P to resume)[/dim]"]
+        else:
+            wave = _waveform(self._rms_history)
+            quality = _quality_indicator(rms)
+            parts = [f"  ⏺ {time_str}  {wave}  {quality}"]
+            if silence_elapsed > 0:
+                parts[0] += f"  [dim]silence {int(silence_elapsed)}s[/dim]"
 
-        # Add warnings below if any
         for w in self._warnings:
             parts.append(f"  [yellow]⚠ {w}[/yellow]")
 
