@@ -85,6 +85,10 @@ DEFAULT_CONFIG = {
     "audio": {
         # Keep the source WAV after successful transcription (True) or delete it (False)
         "keep_recording": True,
+        # Diarize mic channel (for conference room with multiple local speakers)
+        # False (default): mic = "You" — fastest, correct when alone at desk
+        # True: run Sortformer on mic channel too to separate local speakers
+        "diarize_mic": False,
     },
 
     # Accepted audio file types for transcription and listing
@@ -791,21 +795,22 @@ def cmd_record(args):
     recording = True
     paused = False
     silence_start = None
-    current_rms = 0.0
+    current_mic_rms = 0.0
+    current_sys_rms = 0.0
     start_time = time.time()
     lock = threading.Lock()
 
     def mic_callback(indata, frame_count, time_info, status):
-        nonlocal silence_start, current_rms, recording
+        nonlocal silence_start, current_mic_rms, recording
         if not recording:
             raise sd.CallbackAbort()
         if paused:
-            return  # discard audio while paused
+            return
         mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
         with lock:
             mic_frames.append(mono.copy())
-            current_rms = float(np.sqrt(np.mean(mono ** 2)))
-            if current_rms < SILENCE_THRESHOLD:
+            current_mic_rms = float(np.sqrt(np.mean(mono ** 2)))
+            if current_mic_rms < SILENCE_THRESHOLD:
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start >= SILENCE_TIMEOUT:
@@ -815,18 +820,17 @@ def cmd_record(args):
                 silence_start = None
 
     def sys_callback(indata, frame_count, time_info, status):
-        nonlocal silence_start, current_rms
+        nonlocal silence_start, current_sys_rms
         if not recording:
             raise sd.CallbackAbort()
         if paused:
-            return  # discard audio while paused
+            return
         mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
         with lock:
             sys_frames.append(mono.copy())
-            sys_rms = float(np.sqrt(np.mean(mono ** 2)))
-            if sys_rms > SILENCE_THRESHOLD:
+            current_sys_rms = float(np.sqrt(np.mean(mono ** 2)))
+            if current_sys_rms > SILENCE_THRESHOLD:
                 silence_start = None
-                current_rms = max(current_rms, sys_rms)
 
     blocksize = int(SAMPLE_RATE * 0.5)
 
@@ -862,15 +866,17 @@ def cmd_record(args):
                         silence_start = None  # don't count pause as silence
 
                 with lock:
-                    rms = current_rms
+                    mic_rms = current_mic_rms
+                    sys_rms_val = current_sys_rms
                     sil = silence_start
 
+                rms = max(mic_rms, sys_rms_val)  # combined for quality indicator
                 elapsed = time.time() - start_time
                 silence_elapsed = time.time() - sil if sil else 0
 
                 # Warnings: mic low + system health
                 warning = None
-                if not paused and rms < 0.001:
+                if not paused and mic_rms < 0.001:
                     if mic_low_since_rec is None:
                         mic_low_since_rec = time.time()
                     elif time.time() - mic_low_since_rec > MIC_LOW_WARNING_SECONDS:
@@ -888,7 +894,9 @@ def cmd_record(args):
 
                 display.set_warning(warning)
 
-                display.update(rms, elapsed, silence_elapsed, paused=paused)
+                display.update(rms, elapsed, silence_elapsed, paused=paused,
+                              mic_rms=mic_rms if dual_mode else None,
+                              sys_rms=sys_rms_val if dual_mode else None)
                 time.sleep(0.25)
 
         auto_stopped = True
@@ -927,16 +935,18 @@ def cmd_record(args):
 
 
 def _mix_audio(mic_frames, sys_frames, dual_mode):
-    """Mix mic + system audio into mono. Normalizes each channel before mixing."""
+    """Combine mic + system audio. Returns stereo (N,2) when dual, mono (N,) when single.
+
+    Stereo format: channel 0 = mic, channel 1 = system audio.
+    Each channel is independently normalized before combining.
+    """
     if not mic_frames:
         return np.array([], dtype=np.float32)
     mic_audio = _normalize(np.concatenate(mic_frames).flatten())
     if dual_mode and sys_frames:
         sys_audio = _normalize(np.concatenate(sys_frames).flatten())
         min_len = min(len(mic_audio), len(sys_audio))
-        mic_audio = mic_audio[:min_len]
-        sys_audio = sys_audio[:min_len]
-        return (mic_audio + sys_audio) / 2.0
+        return np.column_stack([mic_audio[:min_len], sys_audio[:min_len]])
     return mic_audio
 
 
@@ -1114,18 +1124,18 @@ def cmd_live(args):
                 current_rms = max(current_rms, sys_rms_val)
 
     def _get_mixed_snapshot():
-        """Get current mixed audio snapshot (copies frame lists under lock)."""
+        """Get current mixed audio snapshot as mono (for live chunk transcription)."""
         with lock:
             if not mic_frames:
                 return None
             mic_copy = list(mic_frames)
             sys_copy = list(sys_frames) if dual_mode else []
-        audio = np.concatenate(mic_copy).flatten()
+        mic_audio = _normalize(np.concatenate(mic_copy).flatten())
         if sys_copy:
-            bh = np.concatenate(sys_copy).flatten()
-            min_len = min(len(audio), len(bh))
-            audio = (audio[:min_len] + bh[:min_len]) / 2.0
-        return audio
+            sys_audio = _normalize(np.concatenate(sys_copy).flatten())
+            min_len = min(len(mic_audio), len(sys_audio))
+            return (mic_audio[:min_len] + sys_audio[:min_len]) / 2.0
+        return mic_audio
 
     def _adapt_chunking(audio_seconds, process_seconds):
         """Adjust chunk interval and batch size based on processing speed."""
@@ -1354,7 +1364,11 @@ def cmd_live(args):
     print(f"  📁 Saved: {output_path.name}")
 
     # ── Transcribe remaining audio ────────────────────────────────────────
-    flat_audio = audio_data.flatten().astype(np.float32)
+    # For live post-processing, use mono downmix (per-channel is done by cmd_run)
+    if audio_data.ndim == 2:
+        flat_audio = audio_data.mean(axis=1).astype(np.float32)
+    else:
+        flat_audio = audio_data.flatten().astype(np.float32)
     total_samples = len(flat_audio)
     remaining = total_samples - last_transcribed_sample
 
@@ -1407,15 +1421,24 @@ def cmd_live(args):
 
     result = {"segments": all_segments, "language": language}
 
-    # ── Diarization (always on unless --no-diarize) ─────────────────────
-    # MLX has word timestamps built in — no alignment step needed
+    # ── Diarization ─────────────────────────────────────────────────────
     diarize_enabled = config["diarization"]["enabled"] and not no_diarize
     if diarize_enabled and not HF_TOKEN:
         print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
     if HF_TOKEN and diarize_enabled:
         print("  ⏳ Identifying speakers...")
         try:
-            speaker_turns = _diarize_standalone(str(output_path))
+            # For stereo files, diarize system channel only
+            if _is_stereo(str(output_path)):
+                mic_tmp, sys_tmp = _split_stereo(str(output_path))
+                try:
+                    speaker_turns = _diarize_standalone(sys_tmp)
+                finally:
+                    for p in (mic_tmp, sys_tmp):
+                        if p and os.path.exists(p):
+                            os.unlink(p)
+            else:
+                speaker_turns = _diarize_standalone(str(output_path))
             result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
         except Exception as e:
             print(f"  ⚠  Diarization failed: {e}")
@@ -1579,6 +1602,45 @@ class ProgressTracker:
 
 
 # ─── Audio Loading & Processing ───────────────────────────────────────────────
+
+def _is_stereo(audio_path):
+    """Check if an audio file is stereo (2 channels)."""
+    import soundfile as sf
+    info = sf.info(str(audio_path))
+    return info.channels == 2
+
+
+def _split_stereo(audio_path, sr=16000):
+    """Split a stereo WAV into two mono temp files (mic, system).
+
+    Returns (mic_path, sys_path) as temp file paths. Caller must clean up.
+    """
+    import soundfile as sf
+    data, file_sr = sf.read(str(audio_path), dtype="float32")
+    if data.ndim == 1:
+        return None, None  # mono file
+    mic = data[:, 0]
+    sys_audio = data[:, 1]
+    mic_path = tempfile.mktemp(suffix="_mic.wav")
+    sys_path = tempfile.mktemp(suffix="_sys.wav")
+    sf.write(mic_path, mic, file_sr, subtype="PCM_16")
+    sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
+    return mic_path, sys_path
+
+
+def _merge_transcripts(mic_result, sys_result):
+    """Merge two transcripts (mic + system) by timestamp into one result.
+
+    Both inputs should already have speaker labels assigned.
+    """
+    all_segments = mic_result.get("segments", []) + sys_result.get("segments", [])
+    all_segments.sort(key=lambda s: s.get("start", 0))
+
+    return {
+        "segments": all_segments,
+        "language": mic_result.get("language", sys_result.get("language", "en")),
+    }
+
 
 def _normalize(audio, target_rms=0.05):
     """Normalize audio to target RMS level. Handles both quiet and loud input."""
@@ -1894,13 +1956,20 @@ def cmd_run(args):
     denoise_enabled = config.get("denoise", {}).get("enabled", True) and not no_denoise and not is_parakeet_model
     denoise_factor = config.get("denoise", {}).get("factor", 2.0)
 
+    is_stereo_input = _is_stereo(audio_path)
     engine_label = "parakeet (GPU)" if is_parakeet_model else "mlx (GPU)"
     model_size = MODEL_INFO.get(model_name, {}).get("size", "?")
     diar_label = "Sortformer (GPU)" if diarize_enabled else "off"
     denoise_label = f"spectral sub {denoise_factor}x" if denoise_enabled else "off"
+    channels_label = "stereo (mic + system)" if is_stereo_input else "mono"
 
     denoise_prefix = "Denoise → " if denoise_enabled else ""
-    if diarize_enabled:
+    if is_stereo_input:
+        if diarize_enabled:
+            steps_preview = f"{denoise_prefix}Diarize system → Transcribe mic + system → Save"
+        else:
+            steps_preview = f"{denoise_prefix}Transcribe mic + system → Save"
+    elif diarize_enabled:
         steps_preview = f"{denoise_prefix}Diarize → Transcribe → Save"
     else:
         steps_preview = f"{denoise_prefix}Transcribe → Save"
@@ -1909,6 +1978,7 @@ def cmd_run(args):
     rows = [
         ("File:", Path(audio_path).name),
         ("Duration:", format_duration(audio_duration)),
+        ("Channels:", channels_label),
         ("Engine:", engine_label),
         ("Model:", f"{model_name} ({model_size})"),
         ("Language:", language),
@@ -1924,7 +1994,7 @@ def cmd_run(args):
 
     diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
 
-    # Pipeline steps: MLX diarizes FIRST to avoid GPU memory contention
+    # Pipeline steps
     if diarize_enabled:
         step_names = ["Identifying speakers", "Transcribing", "Saving"]
         step_weights = [0.15, 0.80, 0.05]
@@ -1948,8 +2018,9 @@ def cmd_run(args):
     try:
         step = 0
 
-        # ── Denoise ──
-        if denoise_enabled:
+        # ── Denoise (Whisper only, mono only — stereo has clean per-channel audio) ──
+        is_stereo_file = _is_stereo(audio_path)
+        if denoise_enabled and not is_stereo_file:
             progress.set_step(step)
             denoised_path, denoise_time = _denoise_audio(audio_path)
             transcribe_path = denoised_path
@@ -1958,30 +2029,101 @@ def cmd_run(args):
             transcribe_path = audio_path
 
         import mlx.core as mx
-        # Diarize FIRST with small Sortformer model (~100MB),
-        # free GPU memory, THEN transcribe with large Whisper/Parakeet model.
-        speaker_turns = None
 
-        if diarize_enabled:
-            progress.set_step(step)  # Identifying speakers
-            speaker_turns = _diarize_standalone(audio_path)
-            gc.collect()
-            mx.clear_cache()  # Free Sortformer GPU memory
+        if is_stereo_file:
+            # ── Stereo pipeline: transcribe each channel independently ──
+            mic_path, sys_path = _split_stereo(transcribe_path)
+            diarize_mic = config.get("audio", {}).get("diarize_mic", False)
+            try:
+                # Diarize system channel (remote speakers) — always when enabled
+                sys_speaker_turns = None
+                mic_speaker_turns = None
+                if diarize_enabled:
+                    progress.set_step(step)  # Identifying speakers
+                    sys_speaker_turns = _diarize_standalone(sys_path)
+                    if diarize_mic:
+                        gc.collect()
+                        mx.clear_cache()
+                        mic_speaker_turns = _diarize_standalone(mic_path)
+                    gc.collect()
+                    mx.clear_cache()
+                    step += 1
+
+                progress.set_step(step)  # Transcribing
+
+                # Transcribe mic channel
+                if _is_parakeet(model_name):
+                    mic_result = _transcribe_parakeet(mic_path, model_name)
+                else:
+                    mic_result = _transcribe_mlx(mic_path, model_name, language)
+
+                gc.collect()
+                mx.clear_cache()
+
+                # Transcribe system channel
+                if _is_parakeet(model_name):
+                    sys_result = _transcribe_parakeet(sys_path, model_name)
+                else:
+                    sys_result = _transcribe_mlx(sys_path, model_name, language)
+
+                # Assign speaker labels — system channel
+                if sys_speaker_turns:
+                    sys_result["segments"] = _assign_speakers_to_segments(
+                        sys_result.get("segments", []), sys_speaker_turns)
+                else:
+                    for seg in sys_result.get("segments", []):
+                        seg["speaker"] = "Remote"
+
+                # Assign speaker labels — mic channel
+                if mic_speaker_turns:
+                    # Conference room: diarize mic to separate local speakers
+                    mic_result["segments"] = _assign_speakers_to_segments(
+                        mic_result.get("segments", []), mic_speaker_turns)
+                    # Prefix local speakers to distinguish from remote
+                    for seg in mic_result.get("segments", []):
+                        if seg.get("speaker", "").startswith("SPEAKER_"):
+                            num = int(seg["speaker"].split("_")[1]) + 1
+                            seg["speaker"] = f"Local {num}"
+                else:
+                    # Default: mic = "You"
+                    mic_label = config.get("user_name", "You") or "You"
+                    for seg in mic_result.get("segments", []):
+                        seg["speaker"] = mic_label
+
+                # Merge both channels by timestamp
+                result = _merge_transcripts(mic_result, sys_result)
+            finally:
+                for p in (mic_path, sys_path):
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+
             step += 1
+            progress.set_step(step)  # Saving
 
-        progress.set_step(step)  # Transcribing
-        if _is_parakeet(model_name):
-            result = _transcribe_parakeet(transcribe_path, model_name)
         else:
-            result = _transcribe_mlx(transcribe_path, model_name, language,
-                                     word_timestamps=not diarize_enabled)
+            # ── Mono pipeline: original behavior ──
+            speaker_turns = None
 
-        if speaker_turns is not None:
-            result["segments"] = _assign_speakers_to_segments(
-                result.get("segments", []), speaker_turns)
+            if diarize_enabled:
+                progress.set_step(step)  # Identifying speakers
+                speaker_turns = _diarize_standalone(audio_path)
+                gc.collect()
+                mx.clear_cache()
+                step += 1
 
-        step += 1
-        progress.set_step(step)  # Saving
+            progress.set_step(step)  # Transcribing
+            if _is_parakeet(model_name):
+                result = _transcribe_parakeet(transcribe_path, model_name)
+            else:
+                result = _transcribe_mlx(transcribe_path, model_name, language,
+                                         word_timestamps=not diarize_enabled)
+
+            if speaker_turns is not None:
+                result["segments"] = _assign_speakers_to_segments(
+                    result.get("segments", []), speaker_turns)
+
+            step += 1
+            progress.set_step(step)  # Saving
 
     except Exception as e:
         progress.stop()
