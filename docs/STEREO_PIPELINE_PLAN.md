@@ -8,8 +8,13 @@
 
 ## Phase 0: Go All-MLX (remove torch + whisperx + pyannote + librosa)
 
-Drop the CPU engine path, voice enrollment, and heavy dependencies. MLX only.
-Speaker auto-matching kept via ONNX (onnxruntime already installed for mlx_audio).
+Drop the CPU engine path, voice enrollment, speaker auto-matching, and heavy dependencies. MLX only.
+
+**Speaker auto-matching dropped**: `pyannote/embedding` (512-dim XVectorSincNet) is incompatible
+with the available ONNX model (256-dim ResNet34). Different architectures, different dimensions,
+different embedding spaces. Existing profiles cannot be migrated. The stereo pipeline (Phase 1-3)
+provides "You" vs "Remote" speaker identity for free — auto-matching becomes less important.
+Can re-add with ONNX-based enrollment in the future.
 
 ### What gets removed (~940 MB)
 
@@ -112,48 +117,43 @@ def _stft(audio, n_fft=2048, hop_length=512):
 - [ ] Remove `diarization.model` config (pyannote model path)
 - [ ] Remove `warnings.filterwarnings("ignore", module="pyannote")`
 
-**Step 0c: Replace speaker embeddings (pyannote → ONNX)**
-- [ ] Rewrite `load_embedding_model()`: ONNX InferenceSession instead of pyannote Inference
-- [ ] Rewrite `extract_speaker_embedding()`: load audio slice → fbank features → ONNX → 256-dim vector
-- [ ] Keep `load_speaker_profiles()`, `save_speaker_profile()`, `match_speakers()` (pure numpy)
-- [ ] Keep `resolve_speaker_names()` (rewire to use new embedding functions)
-- [ ] Download ONNX model: `Alkd/speaker-embedding-onnx` (~26 MB) via huggingface_hub
-- [ ] Fbank feature extraction: use numpy (mel filterbank + log, ~15 lines)
-
-**Step 0d: Remove cmd_enroll**
+**Step 0c: Remove all speaker embedding/enrollment/naming code**
 - [ ] Delete `cmd_enroll()` function (~140 lines)
+- [ ] Delete `load_embedding_model()`, `extract_speaker_embedding()`, `save_speaker_profile()`
+- [ ] Delete `load_speaker_profiles()`, `match_speakers()`, `resolve_speaker_names()`
 - [ ] Remove `enroll` subcommand from argparse
-- [ ] Remove enrollment-specific config keys (`enrollment_duration_seconds`)
-- [ ] Update README: remove enrollment section
+- [ ] Remove `--speakers` / `-s` CLI flag from `run` and `live` commands
+- [ ] Remove `speaker_memory` config section entirely
+- [ ] Replace speaker naming with simple inline rename: `SPEAKER_00` → `Speaker 1`
+- [ ] Update README: remove enrollment section, remove --speakers flag docs
+- [ ] Future: ONNX-based enrollment + auto-matching can be added later if needed
 
-**Step 0e: Replace librosa with ffmpeg + numpy.fft**
+**Step 0d: Replace librosa with ffmpeg + numpy.fft**
 - [ ] New `_load_audio(path, sr=16000)`: ffmpeg subprocess → numpy float32 array
 - [ ] Replace `librosa.load()` in `_denoise_audio()` with `_load_audio()`
 - [ ] Replace `librosa.stft()` with numpy windowed FFT (~8 lines)
 - [ ] Replace `librosa.istft()` with numpy overlap-add (~8 lines)
-- [ ] Remove `--no-denoise` CLI flag (keep denoise config — it still works, just different backend)
+- [ ] Keep `--no-denoise` CLI flag (denoising stays, just different backend)
 
-Actually wait — we said keep denoising. So keep `--no-denoise` flag too.
-
-**Step 0f: Update dependencies**
+**Step 0e: Update dependencies**
 - [ ] pyproject.toml: remove `whisperx` dependency
 - [ ] pyproject.toml: keep `sounddevice`, `soundfile`, `numpy`, `rich`, `psutil`, `pyobjc-framework-ScreenCaptureKit`
 - [ ] pyproject.toml: add `mlx-audio`, `mlx-whisper` (were implicit via whisperx)
 - [ ] Remove all dead imports from transcriber.py
 
-**Step 0g: Dead config cleanup**
+**Step 0f: Dead config cleanup**
 - [ ] Remove: `engine`, `compute_type`, `device`
 - [ ] Remove: `diarization.engine`, `diarization.model`
-- [ ] Remove: `speaker_memory.embedding_model` (replace with ONNX model path)
+- [ ] Remove: entire `speaker_memory` config section
 - [ ] Remove: `denoise` section? NO — keep it (feature stays, backend changes)
 - [ ] Keep: everything else (paths, recording, batch_sizes, live, watch, diarization.enabled/threshold/etc)
 
-**Step 0h: Update README + test**
+**Step 0g: Update README + test**
 - [ ] Update README: remove CPU engine, voice enrollment, update deps section
 - [ ] Test: `transcribe rec` → transcribe → verify Parakeet + Sortformer pipeline
 - [ ] Test: `transcribe run file.mp3` → verify ffmpeg audio loading
 - [ ] Test: `transcribe run file.wav -m small.en` → verify denoising with numpy.fft
-- [ ] Test: speaker auto-matching with ONNX embeddings
+- [ ] Test: verify no pyannote/torch/librosa imports remain
 - [ ] Clean venv install test: verify ~280 MB total
 
 ---
@@ -198,7 +198,7 @@ Transcription (3+ person call):          │
 | Crosstalk handled gracefully | Both talking? Each channel still clear |
 | Independent volume/gain per channel | Boost quiet remote speaker without affecting mic |
 | 3+ calls: easier diarization | Sortformer separates N-1 speakers on cleaner system audio |
-| WhisperX alignment improves | Aligning against clean per-speaker audio |
+| Word timestamps improve | Each ASR pass aligns against clean per-speaker audio |
 
 ## Risks
 
@@ -276,5 +276,3 @@ When `diarize_mic: true`:
 | Parakeet | Mono 16kHz | Run twice: once per channel |
 | Whisper | Mono 16kHz | Same |
 | Sortformer | Mono 16kHz | Always on system channel. On mic channel only if `diarize_mic: true` |
-| pyannote | Mono 16kHz | Same — fallback for either channel |
-| WhisperX align | Mono 16kHz | Run twice: align each channel's transcript against its own audio |

@@ -5,7 +5,8 @@ description = "Record interviews, transcribe with speaker diarization, save to O
 license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
-    "whisperx>=3.8",
+    "mlx-audio>=0.4",
+    "mlx-whisper>=0.4",
     "sounddevice>=0.5",
     "soundfile>=0.13",
     "numpy>=2.1",
