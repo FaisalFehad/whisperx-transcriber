@@ -4,7 +4,7 @@
 
     "_comment_engine": "Engine: 'mlx' = Apple Silicon GPU (~7x faster), 'whisperx' = CPU (compatible)",
     "engine": "mlx",
-    "_comment_model": "parakeet = best accuracy, no hallucinations. Or Whisper: small.en, medium.en, turbo, etc.",
+    "_comment_model": "parakeet = Best accuracy and speed - works best with english",
     "default_model": "parakeet",
     "_comment_language": "Supported languages: https://github.com/openai/whisper#available-models-and-languages",
     "language": "en",

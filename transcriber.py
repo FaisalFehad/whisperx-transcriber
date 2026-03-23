@@ -8,7 +8,6 @@ Commands:
     transcribe live                 Record + transcribe simultaneously
     transcribe watch                Auto-record meetings from calendar
     transcribe list                 List available recordings
-    transcribe list                 List available recordings
     transcribe setup                Audio device setup guide
 """
 
@@ -74,7 +73,7 @@ DEFAULT_CONFIG = {
         "sample_rate": 16000,
         # RMS level below this = silence (0.005 works for most mics)
         # Lower = more sensitive, higher = ignores quiet speech
-        "silence_threshold": 0.005,
+        "silence_threshold": 0.010,
         # Minutes of continuous silence before auto-stopping recording
         "silence_timeout_minutes": 10,
         # Seconds of low mic level before showing warning
@@ -168,13 +167,27 @@ DEFAULT_CONFIG = {
         "record_only": True,
     },
 
-    # ── Audio denoising (Whisper only — Parakeet skips this) ────────────
-    "denoise": {
-        # Spectral subtraction to reduce background noise before Whisper transcription.
-        # Parakeet doesn't need this (CTC architecture can't hallucinate on silence).
-        # Uses first N seconds as noise profile — works best when audio starts
-        # with silence or hold music (before speech begins).
+    # ── Audio normalization ──────────────────────────────────────────────
+    "normalize": {
+        # Normalize audio volume before transcription.
+        # Scales to target RMS with peak headroom to prevent clipping.
+        # Each stereo channel is normalized independently.
         "enabled": True,
+        # Target RMS level (linear). 0.05 ≈ -26 dBFS — good for all models.
+        "target_rms": 0.05,
+        # Peak headroom in dB. Prevents peaks from exceeding -N dBFS.
+        # 1.0 dB keeps peaks at -1 dBFS (0.891 linear) — no clipping.
+        "peak_headroom_db": 1.0,
+    },
+
+    # ── Audio denoising ─────────────────────────────────────────────────
+    "denoise": {
+        # Spectral subtraction to reduce background noise before transcription.
+        # Disabled by default — eval tests showed all models handle noise well
+        # without preprocessing (+6-14% WER increase with denoise on).
+        # Enable with --denoise flag for recordings with heavy constant noise
+        # that start with silence (first N seconds used as noise profile).
+        "enabled": False,
         # Over-subtraction factor: how aggressively to remove noise.
         # 2.0 = balanced (recommended). Higher = more removal but risks speech distortion.
         "factor": 2.0,
@@ -252,6 +265,17 @@ VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")  # filtered fr
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 
 MODEL_INFO = config["models"]
+
+# ─── Debug Logging ────────────────────────────────────────────────────────────
+
+_DEBUG = config.get("debug", False)
+
+def _log(tag, **kwargs):
+    """Pipeline debug log. Prints to stderr when debug=true or --debug flag."""
+    if not _DEBUG:
+        return
+    parts = " ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(f"  [{tag}] {parts}", file=sys.stderr, flush=True)
 STEP_NAMES = ["Transcribing", "Saving"]  # default; overridden by cmd_run with actual pipeline steps
 
 
@@ -934,19 +958,28 @@ def cmd_record(args):
     prompt_transcribe(str(output_path))
 
 
-def _mix_audio(mic_frames, sys_frames, dual_mode):
+def _mix_audio(mic_frames, sys_frames, dual_mode, normalize=True):
     """Combine mic + system audio. Returns stereo (N,2) when dual, mono (N,) when single.
 
     Stereo format: channel 0 = mic, channel 1 = system audio.
-    Each channel is independently normalized before combining.
+    Each channel is independently normalized before combining (unless normalize=False).
     """
     if not mic_frames:
         return np.array([], dtype=np.float32)
-    mic_audio = _normalize(np.concatenate(mic_frames).flatten())
+    mic_audio = np.concatenate(mic_frames).flatten()
+    if normalize:
+        mic_audio = _normalize(mic_audio)
     if dual_mode and sys_frames:
-        sys_audio = _normalize(np.concatenate(sys_frames).flatten())
+        sys_audio = np.concatenate(sys_frames).flatten()
+        if normalize:
+            sys_audio = _normalize(sys_audio)
         min_len = min(len(mic_audio), len(sys_audio))
+        _log("mix", mode="stereo", normalize=normalize, samples=min_len,
+             mic_rms=f"{np.sqrt(np.mean(mic_audio[:min_len]**2)):.5f}",
+             sys_rms=f"{np.sqrt(np.mean(sys_audio[:min_len]**2)):.5f}")
         return np.column_stack([mic_audio[:min_len], sys_audio[:min_len]])
+    _log("mix", mode="mono", normalize=normalize, samples=len(mic_audio),
+         rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}")
     return mic_audio
 
 
@@ -968,7 +1001,9 @@ def prompt_transcribe(audio_path):
             title=title or None,
             language=config["language"],
             no_diarize=False,
+            denoise=False,
             no_denoise=False,
+            debug=False,
         )
         cmd_run(run_args)
     else:
@@ -1625,6 +1660,9 @@ def _split_stereo(audio_path, sr=16000):
     sys_path = tempfile.mktemp(suffix="_sys.wav")
     sf.write(mic_path, mic, file_sr, subtype="PCM_16")
     sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
+    _log("split", duration=f"{len(mic)/file_sr:.1f}s",
+         mic_rms=f"{np.sqrt(np.mean(mic**2)):.5f}",
+         sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
     return mic_path, sys_path
 
 
@@ -1633,8 +1671,19 @@ def _merge_transcripts(mic_result, sys_result):
 
     Both inputs should already have speaker labels assigned.
     """
-    all_segments = mic_result.get("segments", []) + sys_result.get("segments", [])
+    mic_segs = mic_result.get("segments", [])
+    sys_segs = sys_result.get("segments", [])
+    all_segments = mic_segs + sys_segs
     all_segments.sort(key=lambda s: s.get("start", 0))
+
+    # Count overlapping segments (crosstalk)
+    overlaps = 0
+    for i in range(len(all_segments) - 1):
+        if all_segments[i].get("end", 0) > all_segments[i + 1].get("start", 0):
+            overlaps += 1
+
+    _log("merge", mic_segs=len(mic_segs), sys_segs=len(sys_segs),
+         total=len(all_segments), overlaps=overlaps)
 
     return {
         "segments": all_segments,
@@ -1642,12 +1691,31 @@ def _merge_transcripts(mic_result, sys_result):
     }
 
 
-def _normalize(audio, target_rms=0.05):
-    """Normalize audio to target RMS level. Handles both quiet and loud input."""
+def _normalize(audio, target_rms=0.05, peak_headroom_db=1.0):
+    """Normalize audio to target RMS with peak headroom to prevent clipping.
+
+    Scales to target_rms unless that would push peaks above the ceiling
+    (-peak_headroom_db from full scale). In that case, gain is reduced
+    so peaks stay below the ceiling — no hard clipping, no distortion.
+    """
     rms = np.sqrt(np.mean(audio ** 2))
-    if rms > 1e-6:
-        audio = audio * (target_rms / rms)
-    return np.clip(audio, -1.0, 1.0)
+    if rms < 1e-6:
+        return audio
+    peak = float(np.max(np.abs(audio)))
+    # Gain needed to reach target RMS
+    rms_gain = target_rms / rms
+    # Max gain before peaks hit ceiling (e.g. -1 dBFS = 0.891)
+    peak_ceiling = 10 ** (-peak_headroom_db / 20)  # linear
+    peak_gain = peak_ceiling / peak if peak > 1e-6 else rms_gain
+    # Use the lesser — reach target RMS or stay under ceiling
+    gain = min(rms_gain, peak_gain)
+    audio = audio * gain
+    actual_rms = float(np.sqrt(np.mean(audio ** 2)))
+    actual_peak = float(np.max(np.abs(audio)))
+    limited = "peak-limited" if gain < rms_gain else "rms-target"
+    _log("norm", rms_in=f"{rms:.5f}", rms_out=f"{actual_rms:.5f}",
+         gain=f"{gain:.2f}x", peak=f"{actual_peak:.3f}", mode=limited)
+    return audio
 
 
 def _load_audio(path, sr=16000):
@@ -1661,7 +1729,10 @@ def _load_audio(path, sr=16000):
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed to load {path}: {result.stderr.decode()[:200]}")
-    return np.frombuffer(result.stdout, dtype=np.float32)
+    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    _log("load", file=Path(path).name, sr=sr, duration=f"{len(audio)/sr:.1f}s",
+         rms=f"{np.sqrt(np.mean(audio**2)):.5f}", peak=f"{np.max(np.abs(audio)):.3f}")
+    return audio
 
 
 def _stft(audio, n_fft=2048, hop_length=512):
@@ -1741,9 +1812,15 @@ def _denoise_audio(audio_path):
         sf.write(tmp_path, denoised, sr)
 
         elapsed = time.time() - t0
+        noise_rms = float(np.sqrt(np.mean(noise_clip ** 2)))
+        in_rms = float(np.sqrt(np.mean(audio ** 2)))
+        out_rms = float(np.sqrt(np.mean(denoised ** 2)))
+        _log("denoise", factor=factor, noise_rms=f"{noise_rms:.5f}",
+             rms_in=f"{in_rms:.5f}", rms_out=f"{out_rms:.5f}", time=f"{elapsed:.1f}s")
         return tmp_path, elapsed
 
     except Exception as e:
+        _log("denoise", error=str(e))
         print(f"  ⚠  Denoising failed ({e}), using original audio")
         return audio_path, 0
 
@@ -1767,6 +1844,7 @@ def _transcribe_mlx(audio_path, model_name, language="en", word_timestamps=True)
     if hst is not None:
         word_timestamps = True  # Required for HST
 
+    t0 = time.time()
     result = mlx_whisper.transcribe(
         audio_path,
         path_or_hf_repo=repo,
@@ -1774,6 +1852,11 @@ def _transcribe_mlx(audio_path, model_name, language="en", word_timestamps=True)
         language=language,
         hallucination_silence_threshold=hst,
     )
+    segs = result.get("segments", [])
+    words = sum(len(s.get("text", "").split()) for s in segs)
+    speech_dur = sum(s.get("end", 0) - s.get("start", 0) for s in segs)
+    _log("asr", model=model_name, segments=len(segs), words=words,
+         speech=f"{speech_dur:.1f}s", time=f"{time.time()-t0:.1f}s")
     return result
 
 
@@ -1804,6 +1887,11 @@ def _transcribe_parakeet(audio_path, model_name="parakeet"):
             "end": sentence.end,
             "text": sentence.text,
         })
+
+    words = sum(len(s.get("text", "").split()) for s in segments)
+    speech_dur = sum(s.get("end", 0) - s.get("start", 0) for s in segments)
+    _log("asr", model=model_name, segments=len(segments), words=words,
+         speech=f"{speech_dur:.1f}s")
 
     del model
     gc.collect()
@@ -1868,15 +1956,22 @@ def _diarize_mlx_audio(audio_path):
                 "speaker": f"Speaker {seg.speaker}",
             })
 
+    speakers = set(t["speaker"] for t in turns)
+    _log("diar", speakers=len(speakers), turns=len(turns),
+         labels=sorted(speakers))
+
     del model
     gc.collect()
-    mx.clear_cache()  # Free GPU memory for next model
+    mx.clear_cache()
     return turns
 
 
 def _diarize_standalone(audio_path):
     """Run speaker diarization using MLX Sortformer."""
-    return _diarize_mlx_audio(audio_path)
+    t0 = time.time()
+    turns = _diarize_mlx_audio(audio_path)
+    _log("diar_standalone", file=Path(audio_path).name, time=f"{time.time()-t0:.1f}s")
+    return turns
 
 
 def _assign_speakers_to_segments(segments, speaker_turns):
@@ -1902,6 +1997,9 @@ def _assign_speakers_to_segments(segments, speaker_turns):
 
 def cmd_run(args):
     """Transcribe an audio file with progress tracking."""
+    global _DEBUG
+    if getattr(args, "debug", False):
+        _DEBUG = True
 
     audio_path = args.audio
 
@@ -1923,7 +2021,10 @@ def cmd_run(args):
 
     title = getattr(args, "title", None)
     no_diarize = getattr(args, "no_diarize", False)
+    force_denoise = getattr(args, "denoise", False)
     no_denoise = getattr(args, "no_denoise", False)
+    normalize_cfg = config.get("normalize", {})
+    normalize_enabled = normalize_cfg.get("enabled", True)
     batch_size = config["batch_sizes"].get(model_name, 8)
     batch_size, ram_msg = adaptive_batch_size(batch_size, model_name)
     if ram_msg:
@@ -1948,12 +2049,17 @@ def cmd_run(args):
     speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
     speed_factor *= 0.15  # MLX GPU acceleration
     estimated_time = audio_duration * speed_factor
-    diarize_enabled = config["diarization"]["enabled"] and not no_diarize
+    diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
     if diarize_enabled:
         estimated_time += audio_duration * 0.05  # Sortformer: ~3s per minute
 
     is_parakeet_model = _is_parakeet(model_name)
-    denoise_enabled = config.get("denoise", {}).get("enabled", True) and not no_denoise and not is_parakeet_model
+    if force_denoise:
+        denoise_enabled = True
+    elif no_denoise:
+        denoise_enabled = False
+    else:
+        denoise_enabled = config.get("denoise", {}).get("enabled", False)
     denoise_factor = config.get("denoise", {}).get("factor", 2.0)
 
     is_stereo_input = _is_stereo(audio_path)
@@ -1983,6 +2089,7 @@ def cmd_run(args):
         ("Model:", f"{model_name} ({model_size})"),
         ("Language:", language),
         ("Denoise:", denoise_label),
+        ("Normalize:", f"{normalize_cfg.get('target_rms', 0.05)} RMS" if normalize_enabled else "off"),
         ("Diarize:", diar_label),
         ("Pipeline:", steps_preview),
         ("Est time:", f"~{format_duration(estimated_time)}"),
@@ -1991,8 +2098,6 @@ def cmd_run(args):
     print()
     info_panel("📝 Transcription", rows)
     print()
-
-    diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
 
     # Pipeline steps
     if diarize_enabled:
@@ -2014,11 +2119,12 @@ def cmd_run(args):
     progress.start()
 
     denoised_path = None  # Track temp file for cleanup
+    normalized_path = None  # Track temp file for cleanup
     result = None
     try:
         step = 0
 
-        # ── Denoise (Whisper only, mono only — stereo has clean per-channel audio) ──
+        # ── Denoise (off by default, enable with --denoise flag, mono only) ──
         is_stereo_file = _is_stereo(audio_path)
         if denoise_enabled and not is_stereo_file:
             progress.set_step(step)
@@ -2028,11 +2134,33 @@ def cmd_run(args):
         else:
             transcribe_path = audio_path
 
+        # ── Normalize ──
+        target_rms = normalize_cfg.get("target_rms", 0.05)
+        headroom = normalize_cfg.get("peak_headroom_db", 1.0)
+        if normalize_enabled and not is_stereo_file:
+            import soundfile as sf
+            audio_data = _load_audio(transcribe_path, sr=SAMPLE_RATE)
+            audio_data = _normalize(audio_data, target_rms=target_rms, peak_headroom_db=headroom)
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix=".norm_")
+            os.close(tmp_fd)
+            sf.write(tmp_path, audio_data, SAMPLE_RATE)
+            normalized_path = tmp_path
+            transcribe_path = normalized_path
+
         import mlx.core as mx
 
         if is_stereo_file:
             # ── Stereo pipeline: transcribe each channel independently ──
             mic_path, sys_path = _split_stereo(transcribe_path)
+
+            # Normalize each channel independently
+            if normalize_enabled:
+                import soundfile as sf
+                for ch_path in (mic_path, sys_path):
+                    ch_audio = _load_audio(ch_path, sr=SAMPLE_RATE)
+                    ch_audio = _normalize(ch_audio, target_rms=target_rms, peak_headroom_db=headroom)
+                    sf.write(ch_path, ch_audio, SAMPLE_RATE)
+
             diarize_mic = config.get("audio", {}).get("diarize_mic", False)
             try:
                 # Diarize system channel (remote speakers) — always when enabled
@@ -2141,6 +2269,12 @@ def cmd_run(args):
         if denoised_path and denoised_path != audio_path:
             try:
                 os.unlink(denoised_path)
+            except OSError:
+                pass
+        # Clean up normalized temp file
+        if normalized_path:
+            try:
+                os.unlink(normalized_path)
             except OSError:
                 pass
 
@@ -2431,9 +2565,9 @@ def _rename_speakers(result):
     name_map = {}
     for i, sid in enumerate(speaker_ids):
         name_map[sid] = f"Speaker {i + 1}"
-    # Print speaker count
     if len(name_map) > 1:
         print(f"  🔊 {len(name_map)} speakers detected")
+    _log("speakers", count=len(name_map), labels=list(name_map.values()))
     return name_map
 
 
@@ -2532,7 +2666,7 @@ LAUNCHD_LABEL = "com.transcriber.watch"
 LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
-def _log(msg, also_print=True):
+def _watch_log(msg, also_print=True):
     """Write to watch.log and optionally print."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
@@ -2559,7 +2693,7 @@ def cmd_watch(args):
     refresh_hours = watch_cfg.get("refresh_hours", 3)
     record_only = watch_cfg.get("record_only", True)
 
-    _log("📅 Calendar Watch started")
+    _watch_log("📅 Calendar Watch started")
     from ui import info_panel
     mode_label = "record only → transcribe after" if record_only else "live (record + transcribe)"
     print()
@@ -2582,13 +2716,13 @@ def cmd_watch(args):
         # Filter to future events only
         upcoming = [e for e in events if e["end"] > now]
 
-        _log(f"📅 {len(upcoming)} meetings remaining today")
+        _watch_log(f"📅 {len(upcoming)} meetings remaining today")
         if upcoming:
             for e in upcoming:
                 start_str = e["start"].strftime("%H:%M")
                 end_str = e["end"].strftime("%H:%M")
                 duration = int((e["end"] - e["start"]).total_seconds() / 60)
-                _log(f"   {start_str}-{end_str}  {e['title']}  ({duration}min)")
+                _watch_log(f"   {start_str}-{end_str}  {e['title']}  ({duration}min)")
 
         # ── Process events or sleep ────────────────────────────
         if not upcoming:
@@ -2600,13 +2734,13 @@ def cmd_watch(args):
             wait = (wake_at - datetime.now()).total_seconds()
 
             if wake_at == tomorrow:
-                _log(f"💤 No meetings — sleeping until midnight")
+                _watch_log(f"💤 No meetings — sleeping until midnight")
             else:
-                _log(f"💤 No meetings — refreshing in {refresh_hours}h")
+                _watch_log(f"💤 No meetings — refreshing in {refresh_hours}h")
             try:
                 time.sleep(max(1, wait))
             except KeyboardInterrupt:
-                _log("👋 Watch stopped by user")
+                _watch_log("👋 Watch stopped by user")
                 return
             continue
 
@@ -2619,23 +2753,23 @@ def cmd_watch(args):
             sleep_time = min(wait_seconds, refresh_seconds)
 
             if sleep_time == wait_seconds:
-                _log(f"💤 Next: \"{next_event['title']}\" at {next_event['start'].strftime('%H:%M')} ({format_duration(wait_seconds)})")
+                _watch_log(f"💤 Next: \"{next_event['title']}\" at {next_event['start'].strftime('%H:%M')} ({format_duration(wait_seconds)})")
             else:
-                _log(f"💤 Refreshing calendar in {refresh_hours}h (before \"{next_event['title']}\")")
+                _watch_log(f"💤 Refreshing calendar in {refresh_hours}h (before \"{next_event['title']}\")")
 
             try:
                 time.sleep(max(1, sleep_time))
             except KeyboardInterrupt:
-                _log("👋 Watch stopped by user")
+                _watch_log("👋 Watch stopped by user")
                 return
 
             # If we woke up for refresh (not for the meeting), loop back
             if sleep_time < wait_seconds:
-                _log("🔄 Refreshing calendar...")
+                _watch_log("🔄 Refreshing calendar...")
                 continue
 
         # ── Meeting time — start recording ─────────────────────
-        _log(f"⏺  \"{next_event['title']}\" — auto-recording started")
+        _watch_log(f"⏺  \"{next_event['title']}\" — auto-recording started")
 
         stop_time = next_event["end"] + timedelta(minutes=end_buffer)
 
@@ -2663,13 +2797,13 @@ def cmd_watch(args):
             while datetime.now() < stop_time:
                 ret = proc.poll()
                 if ret is not None:
-                    _log(f"⏹  Recording ended on its own (silence timeout)")
+                    _watch_log(f"⏹  Recording ended on its own (silence timeout)")
                     break
                 time.sleep(10)
 
             # If still running after meeting end + buffer, stop it
             if proc.poll() is None:
-                _log(f"⏹  \"{next_event['title']}\" ended + {end_buffer}min buffer — stopping")
+                _watch_log(f"⏹  \"{next_event['title']}\" ended + {end_buffer}min buffer — stopping")
                 proc.send_signal(signal.SIGINT)
                 proc.wait(timeout=300)
 
@@ -2677,7 +2811,7 @@ def cmd_watch(args):
             if proc.poll() is None:
                 proc.send_signal(signal.SIGINT)
                 proc.wait(timeout=300)
-            _log("👋 Watch stopped by user")
+            _watch_log("👋 Watch stopped by user")
             return
 
         # ── Check if recording was too short ───────────────────
@@ -2689,17 +2823,17 @@ def cmd_watch(args):
                 speech_minutes = duration / 60
 
                 if speech_minutes < min_recording:
-                    _log(f"🗑  \"{next_event['title']}\" too short ({format_duration(duration)}) — discarded")
+                    _watch_log(f"🗑  \"{next_event['title']}\" too short ({format_duration(duration)}) — discarded")
                     try:
                         latest.unlink()
                     except OSError:
                         pass
                 else:
-                    _log(f"✅ \"{next_event['title']}\" recorded ({format_duration(duration)})")
+                    _watch_log(f"✅ \"{next_event['title']}\" recorded ({format_duration(duration)})")
 
                     # Record-only mode: transcribe after recording
                     if record_only:
-                        _log(f"⏳ Transcribing \"{next_event['title']}\"...")
+                        _watch_log(f"⏳ Transcribing \"{next_event['title']}\"...")
                         try:
                             subprocess.run(
                                 [sys.executable, __file__,
@@ -2710,11 +2844,11 @@ def cmd_watch(args):
                                 stdin=subprocess.DEVNULL,
                                 timeout=3600,
                             )
-                            _log(f"✅ \"{next_event['title']}\" transcribed")
+                            _watch_log(f"✅ \"{next_event['title']}\" transcribed")
                         except subprocess.TimeoutExpired:
-                            _log(f"⚠  Transcription timed out (1h limit)")
+                            _watch_log(f"⚠  Transcription timed out (1h limit)")
                         except Exception as e:
-                            _log(f"⚠  Transcription failed: {e}")
+                            _watch_log(f"⚠  Transcription failed: {e}")
 
         time.sleep(5)
 
@@ -2878,11 +3012,13 @@ Examples:
     # run
     run_parser = subparsers.add_parser("run", help="Transcribe a recording")
     run_parser.add_argument("audio", nargs="?", default=None, help="Audio file path")
-    run_parser.add_argument("--model", "-m", default=None, help="Model: tiny/base/small/medium/large-v3")
+    run_parser.add_argument("--model", "-m", default=None, help="Model: parakeet/small.en/medium/turbo/large-v3")
     run_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     run_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
     run_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
-    run_parser.add_argument("--no-denoise", action="store_true", help="Skip audio denoising")
+    run_parser.add_argument("--denoise", action="store_true", help="Enable denoising (off by default)")
+    run_parser.add_argument("--no-denoise", action="store_true", help="Force denoising OFF (overrides config)")
+    run_parser.add_argument("--debug", action="store_true", help="Enable pipeline debug logging")
 
     # live
     live_parser = subparsers.add_parser("live", help="Record + transcribe simultaneously")

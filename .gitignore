@@ -15,7 +15,11 @@ recordings/
 .checkpoints/
 history.jsonl
 
+# Claude Code context (personal, not shared)
+CLAUDE.md
+
 # Test artifacts
+tests/
 denoise_test/
 
 # Temp denoised audio files
