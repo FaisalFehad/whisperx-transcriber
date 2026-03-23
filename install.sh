@@ -96,7 +96,7 @@ fi
 echo ""
 echo "  ℹ  System audio capture uses ScreenCaptureKit (macOS 12.3+)"
 echo "     On first recording, macOS will prompt for Screen Recording permission"
-echo "     No BlackHole or virtual audio driver needed"
+echo "     No virtual audio driver needed"
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 

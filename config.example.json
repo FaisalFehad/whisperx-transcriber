@@ -2,31 +2,10 @@
     "_comment": "Copy this file to config.json and change only what you need.",
     "_comment2": "Any value you omit will use the built-in default.",
 
-    "_comment_engine": "Engine: 'mlx' = Apple Silicon GPU (~7x faster), 'whisperx' = CPU (compatible)",
-    "engine": "mlx",
-    "_comment_model": "parakeet = Best accuracy and speed - works best with english",
     "default_model": "parakeet",
-    "_comment_language": "Supported languages: https://github.com/openai/whisper#available-models-and-languages",
     "language": "en",
-    "_comment_compute": "compute_type and device are only used by the whisperx engine",
-    "compute_type": "int8",
-    "device": "cpu",
-
-    "batch_sizes": {
-        "_comment": "Higher = faster but more RAM. Tuned for M1 16GB.",
-        "tiny": 32,
-        "base": 24,
-        "small": 16,
-        "medium": 8,
-        "small.en": 16,
-        "medium.en": 8,
-        "turbo": 4,
-        "large-v3": 4,
-        "large-v3.en": 4
-    },
 
     "paths": {
-        "_comment": "Change obsidian_base to your vault location.",
         "obsidian_base": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Sessions",
         "recordings_subdir": "Recordings",
         "scripts_subdir": "Scripts"
@@ -36,41 +15,44 @@
         "sample_rate": 16000,
         "silence_threshold": 0.005,
         "silence_timeout_minutes": 10,
-        "blackhole_device": "BlackHole 2ch",
-        "mic_low_warning_seconds": 10
+        "mic_low_warning_seconds": 10,
+        "virtual_device_names": ["Aggregate", "Multi-Output"]
     },
 
-    "whisper": {
-        "_comment": "Only used when default_model is a Whisper model (not parakeet).",
-        "_comment2": "Skips silent segments where hallucination is detected. Set to null to disable.",
-        "hallucination_silence_threshold": 2.0
+    "normalize": {
+        "enabled": true,
+        "target_rms": 0.05,
+        "peak_headroom_db": 1.0
     },
 
     "denoise": {
-        "_comment": "Spectral subtraction — only used with Whisper models. Parakeet skips this automatically.",
-        "_comment2": "Reduces background noise using first N seconds as noise profile.",
-        "enabled": true,
+        "_comment": "Off by default. Enable with --denoise flag for noisy recordings that start with silence.",
+        "enabled": false,
         "factor": 2.0,
-        "noise_profile_seconds": 10
+        "noise_profile_seconds": 10,
+        "n_fft": 2048,
+        "hop_length": 512
+    },
+
+    "parakeet": {
+        "chunk_duration": 30.0
+    },
+
+    "whisper": {
+        "hallucination_silence_threshold": 2.0
     },
 
     "diarization": {
         "enabled": true,
-        "_comment_engine": "mlx-audio = fast Apple GPU (max 4 speakers), pyannote = slow CPU (unlimited speakers)",
-        "engine": "mlx-audio",
-        "model": "pyannote/speaker-diarization-3.1",
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
         "mlx_chunk_duration": 10.0,
-        "_comment_tuning": "threshold (0-1): speaker detection sensitivity. min_duration: ignore segments shorter than this. merge_gap: merge same-speaker segments closer than this.",
         "threshold": 0.5,
         "min_duration": 0.0,
         "merge_gap": 0.0
     },
 
     "live": {
-        "_comment": "Adaptive scaling auto-adjusts chunk_interval and batch_size during recording.",
-        "_comment_model": "Live uses a lighter model for real-time. Post-recording uses default_model.",
-        "model": "small.en",
+        "model": "parakeet",
         "chunk_interval_seconds": 120,
         "min_chunk_interval": 60,
         "max_chunk_interval": 300,
@@ -80,34 +62,25 @@
         "rec_only_ratio": 1.5
     },
 
-    "speaker_memory": {
-        "enabled": true,
-        "similarity_threshold": 0.75,
-        "embedding_model": "pyannote/embedding",
-        "enrollment_duration_seconds": 15
-    },
-
-    "_comment_auto_title": "Use calendar event name as transcript title when recording during a meeting.",
-    "auto_title_from_calendar": true,
-
     "watch": {
-        "_comment": "calendars: [] = watch all. Set ['Work'] to filter.",
         "silence_timeout_minutes": 10,
         "min_recording_minutes": 2,
-        "model": "small",
+        "model": "parakeet",
         "calendars": [],
         "end_buffer_minutes": 2,
         "refresh_hours": 3,
-        "_comment_record_only": "true = record during meeting, transcribe after. false = live transcribe during meeting.",
         "record_only": true
     },
 
-    "_comment_formats": "Supported audio formats: MP3, WAV, M4A, OGG, FLAC, WebM",
+    "audio": {
+        "keep_recording": true,
+        "diarize_mic": false
+    },
+
+    "auto_title_from_calendar": true,
     "audio_formats": [".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm"],
 
     "list": {
         "max_recordings": 20
-    },
-
-    "user_name": ""
+    }
 }

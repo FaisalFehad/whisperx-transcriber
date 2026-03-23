@@ -51,12 +51,9 @@ DEFAULT_CONFIG = {
     # Language code for transcription (e.g. "en", "ar", "fr")
     "language": "en",
 
-    # ── Batch sizes per model ────────────────────────────────────────────
-    # Higher = faster but more RAM. These are tuned for M1 16GB.
-    # Reduce if you get memory errors; increase on machines with more RAM.
-    "batch_sizes": {
-        "small.en": 16, "medium": 8, "large-v3": 4
-    },
+    # ── Batch sizes (legacy — not used by current MLX models) ────────────
+    # MLX models manage batching internally. Kept for config compatibility.
+    "batch_sizes": {},
 
     # ── File paths ───────────────────────────────────────────────────────
     "paths": {
@@ -78,6 +75,9 @@ DEFAULT_CONFIG = {
         "silence_timeout_minutes": 10,
         # Seconds of low mic level before showing warning
         "mic_low_warning_seconds": 10,
+        # Virtual audio device names to exclude from mic selection
+        # Add your virtual audio driver here if it shows up as a mic
+        "virtual_device_names": ["Aggregate", "Multi-Output"],
     },
 
     # Audio file management after transcription
@@ -192,6 +192,16 @@ DEFAULT_CONFIG = {
         "factor": 2.0,
         # Seconds of audio to use as noise profile (from start of file).
         "noise_profile_seconds": 10,
+        # FFT window size and hop for spectral subtraction (advanced)
+        "n_fft": 2048,
+        "hop_length": 512,
+    },
+
+    # ── Parakeet-specific settings ─────────────────────────────────────
+    "parakeet": {
+        # Chunk duration in seconds for processing long audio files
+        # Lower = less RAM but slightly slower. 30s works well for most files.
+        "chunk_duration": 30.0,
     },
 
     # ── List command ─────────────────────────────────────────────────────
@@ -204,10 +214,11 @@ DEFAULT_CONFIG = {
     # speed_factor: multiplier for time estimation (audio_duration × factor)
     # Lower = faster model. These are calibrated for M1 Apple Silicon.
     "models": {
-        "parakeet":  {"speed_factor": 0.5, "description": "Best Accuracy and speed (English) ★", "size": "~2.5GB"},
-        "small.en":  {"speed_factor": 0.5, "description": "Fast, low RAM, English-only",               "size": "~460MB"},
-        "medium":    {"speed_factor": 1.5, "description": "Balanced Multilingual", "size": "~1.5GB"},
-        "large-v3":  {"speed_factor": 4.0, "description": "More capable Multilingual - slow",      "size": "~3GB"},
+        "parakeet":  {"speed_factor": 0.5, "size": "~2.5GB", "ram_gb": 3.0, "description": "Best accuracy and speed (English) ★"},
+        "small.en":  {"speed_factor": 0.5, "size": "~460MB", "ram_gb": 1.0, "description": "Fast, low RAM, English-only"},
+        "medium":    {"speed_factor": 1.5, "size": "~1.5GB", "ram_gb": 2.0, "description": "Balanced multilingual"},
+        "turbo":     {"speed_factor": 1.5, "size": "~800MB", "ram_gb": 1.5, "description": "Whisper turbo (slow on MLX)"},
+        "large-v3":  {"speed_factor": 4.0, "size": "~3GB",   "ram_gb": 3.5, "description": "Most capable multilingual — slow"},
     },
 
     # ── MLX model repos (HuggingFace) ────────────────────────────────
@@ -258,7 +269,9 @@ SILENCE_THRESHOLD = config["recording"]["silence_threshold"]
 SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 
 AUDIO_FORMATS = tuple(config["audio_formats"])
-VIRTUAL_DEVICE_NAMES = ("BlackHole", "Aggregate", "Multi-Output")  # filtered from mic selection
+VIRTUAL_DEVICE_NAMES = tuple(config.get("recording", {}).get(
+    "virtual_device_names", ["Aggregate", "Multi-Output"]
+))
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 
 MODEL_INFO = config["models"]
@@ -702,24 +715,78 @@ def get_available_ram_gb():
         return -1  # unknown
 
 
-def adaptive_batch_size(batch_size, model_name):
-    """Scale batch_size based on available RAM. Returns (adjusted_size, message)."""
+def check_ram_for_model(model_name):
+    """Check if there's enough RAM for the model. Returns warning message or None."""
     available = get_available_ram_gb()
     if available < 0:
-        return batch_size, None  # can't determine, use default
+        return None  # can't determine
 
-    if available < 2:
-        adjusted = max(1, batch_size // 4)
-        return adjusted, f"⚠ Low RAM ({available:.1f}GB free) — batch_size {batch_size}→{adjusted}"
-    elif available < 4:
-        adjusted = max(2, batch_size // 2)
-        return adjusted, f"⚠ Limited RAM ({available:.1f}GB free) — batch_size {batch_size}→{adjusted}"
-    else:
-        return batch_size, None  # plenty of RAM
+    needed = MODEL_INFO.get(model_name, {}).get("ram_gb", 2.0)
+
+    if available < needed:
+        return f"⚠ Low RAM ({available:.1f}GB free, model needs ~{needed:.0f}GB) — may be slow or crash"
+    elif available < needed + 2:
+        return f"⚠ Limited RAM ({available:.1f}GB free) — close to model requirements"
+    return None
 
 
 
 # ─── Audio Device Detection ───────────────────────────────────────────────────
+
+def _cleanup_temp_files(*paths):
+    """Safe cleanup of multiple temporary files."""
+    for p in paths:
+        if p:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _transcribe_audio(audio_path, model_name, language="en", **kwargs):
+    """Transcribe audio using appropriate engine (Parakeet or mlx-whisper)."""
+    if _is_parakeet(model_name):
+        return _transcribe_parakeet(audio_path, model_name)
+    return _transcribe_mlx(audio_path, model_name, language, **kwargs)
+
+
+def _setup_audio_devices():
+    """Get audio device info and recording path. Returns (mic_id, mic_name, dual_mode, source_label, output_path)."""
+    mic_id, mic_name = get_default_mic()
+    dual_mode = _SystemAudioCapture is not None
+    source_label = f"System + {mic_name}" if dual_mode else mic_name
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_path = RECORDINGS_DIR / f"{timestamp}.wav"
+    return mic_id, mic_name, dual_mode, source_label, output_path
+
+
+def _save_transcript(result, audio_path, title, model_name, language,
+                     audio_duration, processing_time, cp_path=None):
+    """Save transcription result as Markdown. Returns (output_file, speaker_names)."""
+    speaker_names = _rename_speakers(result)
+    date_str = extract_recording_date(str(audio_path))
+    metadata = {
+        "model": model_name,
+        "engine": "mlx",
+        "language": language,
+        "audio_duration": audio_duration,
+        "processing_time": processing_time,
+        "audio_file": Path(audio_path).name,
+    }
+    markdown = format_transcript(result, title, speaker_names, date_str, metadata)
+    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
+    output_file = SCRIPTS_DIR / f"{date_str} {safe_title}.md"
+    saved_to = _safe_write_text(output_file, markdown, description="transcript")
+    if saved_to:
+        output_file = saved_to
+
+    if cp_path:
+        _remove_checkpoint(cp_path)
+
+    return output_file, speaker_names
+
 
 def get_default_mic():
     """Get the best available real input device, preferring AirPods over MacBook mic."""
@@ -797,12 +864,7 @@ def cmd_record(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    mic_id, mic_name = get_default_mic()
-    dual_mode = _SystemAudioCapture is not None
-    source_label = f"System + {mic_name}" if dual_mode else mic_name
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_path = RECORDINGS_DIR / f"{timestamp}.wav"
+    mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
 
     from ui import info_panel
     print()
@@ -1058,7 +1120,6 @@ def cmd_live(args):
 
     model_name = args.model or config["live"].get("model", config["default_model"])
     language = args.language or config["language"]
-    batch_size = config["batch_sizes"].get(model_name, 8)
     chunk_interval = config["live"]["chunk_interval_seconds"]
     no_diarize = getattr(args, "no_diarize", False)
     title = getattr(args, "title", None)
@@ -1076,12 +1137,7 @@ def cmd_live(args):
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
-    mic_id, mic_name = get_default_mic()
-    dual_mode = _SystemAudioCapture is not None
-    source_label = f"System + {mic_name}" if dual_mode else mic_name
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_path = RECORDINGS_DIR / f"{timestamp}.wav"
+    mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
 
     from ui import info_panel
     print()
@@ -1117,8 +1173,6 @@ def cmd_live(args):
     live_cfg = config.get("live", {})
     adaptive = {
         "interval": chunk_interval,
-        "batch_size": batch_size,
-        "original_batch_size": batch_size,
         "min_interval": live_cfg.get("min_chunk_interval", 60),
         "max_interval": live_cfg.get("max_chunk_interval", 300),
         "struggle_ratio": live_cfg.get("struggle_ratio", 0.7),
@@ -1183,24 +1237,19 @@ def cmd_live(args):
             adaptive["rec_only"] = True
             adaptive["status_msg"] = "⚠  System busy — record only (will transcribe after)"
         elif ratio > adaptive["struggle_ratio"]:
-            # Struggling — grow interval, shrink batch size
+            # Struggling — grow interval between chunks
             adaptive["interval"] = min(
                 adaptive["max_interval"],
                 int(adaptive["interval"] * 1.5)
             )
-            adaptive["batch_size"] = max(2, adaptive["batch_size"] // 2)
-            adaptive["status_msg"] = f"↑ interval={adaptive['interval']}s batch={adaptive['batch_size']}"
+            adaptive["status_msg"] = f"↑ interval={adaptive['interval']}s"
         elif ratio < 0.3:
-            # Lots of headroom — shrink interval, restore batch size
+            # Lots of headroom — shrink interval
             adaptive["interval"] = max(
                 adaptive["min_interval"],
                 int(adaptive["interval"] * 0.75)
             )
-            adaptive["batch_size"] = min(
-                adaptive["original_batch_size"],
-                adaptive["batch_size"] * 2
-            )
-            adaptive["status_msg"] = f"↓ interval={adaptive['interval']}s batch={adaptive['batch_size']}"
+            adaptive["status_msg"] = f"↓ interval={adaptive['interval']}s"
         else:
             # Healthy — clear status
             adaptive["status_msg"] = ""
@@ -1468,9 +1517,7 @@ def cmd_live(args):
                 try:
                     speaker_turns = _diarize_standalone(sys_tmp)
                 finally:
-                    for p in (mic_tmp, sys_tmp):
-                        if p and os.path.exists(p):
-                            os.unlink(p)
+                    _cleanup_temp_files(mic_tmp, sys_tmp)
             else:
                 speaker_turns = _diarize_standalone(str(output_path))
             result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
@@ -1482,31 +1529,14 @@ def cmd_live(args):
     cp_path = _save_checkpoint(result, str(output_path), title)
 
     try:
-        speaker_names = _rename_speakers(result)
-
         if not title:
             title = Path(output_path).stem.replace("_", " ").replace("-", " ").title()
 
         post_time = time.time() - recording_end
-        date_str = extract_recording_date(str(output_path))
-        metadata = {
-            "model": model_name,
-            "engine": "mlx",
-            "language": language,
-            "audio_duration": elapsed,
-            "processing_time": post_time,
-            "audio_file": output_path.name,
-        }
-        markdown = format_transcript(result, title, speaker_names, date_str, metadata)
-        SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
-        transcript_file = SCRIPTS_DIR / f"{date_str} {safe_title}.md"
-        saved_to = _safe_write_text(transcript_file, markdown, description="transcript")
-        if saved_to:
-            transcript_file = saved_to
-
-        _remove_checkpoint(cp_path)
+        transcript_file, speaker_names = _save_transcript(
+            result, str(output_path), title, model_name, language,
+            elapsed, post_time, cp_path,
+        )
 
         from ui import success_panel
         print()
@@ -1798,7 +1828,8 @@ def _denoise_audio(audio_path):
         audio = _load_audio(audio_path, sr=sr)
 
         noise_clip = audio[: sr * profile_secs]
-        n_fft, hop = 2048, 512
+        n_fft = denoise_cfg.get("n_fft", 2048)
+        hop = denoise_cfg.get("hop_length", 512)
 
         noise_stft = _stft(noise_clip, n_fft=n_fft, hop_length=hop)
         noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
@@ -1888,8 +1919,9 @@ def _transcribe_parakeet(audio_path, model_name="parakeet"):
     from mlx_audio.stt import load as load_stt
 
     repo = config.get("mlx_models", {}).get(model_name, "mlx-community/parakeet-tdt-0.6b-v3")
+    chunk_dur = config.get("parakeet", {}).get("chunk_duration", 30.0)
     model = load_stt(repo)
-    result = model.generate(audio_path, chunk_duration=30.0, verbose=False)
+    result = model.generate(audio_path, chunk_duration=chunk_dur, verbose=False)
 
     # Convert Parakeet sentences to Whisper-compatible segments
     segments = []
@@ -2038,8 +2070,7 @@ def cmd_run(args):
     no_denoise = getattr(args, "no_denoise", False)
     normalize_cfg = config.get("normalize", {})
     normalize_enabled = normalize_cfg.get("enabled", True)
-    batch_size = config["batch_sizes"].get(model_name, 8)
-    batch_size, ram_msg = adaptive_batch_size(batch_size, model_name)
+    ram_msg = check_ram_for_model(model_name)
     if ram_msg:
         print(f"  {ram_msg}")
 
@@ -2193,19 +2224,12 @@ def cmd_run(args):
                 progress.set_step(step)  # Transcribing
 
                 # Transcribe mic channel
-                if _is_parakeet(model_name):
-                    mic_result = _transcribe_parakeet(mic_path, model_name)
-                else:
-                    mic_result = _transcribe_mlx(mic_path, model_name, language)
-
+                mic_result = _transcribe_audio(mic_path, model_name, language)
                 gc.collect()
                 mx.clear_cache()
 
                 # Transcribe system channel
-                if _is_parakeet(model_name):
-                    sys_result = _transcribe_parakeet(sys_path, model_name)
-                else:
-                    sys_result = _transcribe_mlx(sys_path, model_name, language)
+                sys_result = _transcribe_audio(sys_path, model_name, language)
 
                 # Assign speaker labels — system channel
                 if sys_speaker_turns:
@@ -2235,9 +2259,7 @@ def cmd_run(args):
                 # Merge both channels by timestamp
                 result = _merge_transcripts(mic_result, sys_result)
             finally:
-                for p in (mic_path, sys_path):
-                    if p and os.path.exists(p):
-                        os.unlink(p)
+                _cleanup_temp_files(mic_path, sys_path)
 
             step += 1
             progress.set_step(step)  # Saving
@@ -2248,17 +2270,14 @@ def cmd_run(args):
 
             if diarize_enabled:
                 progress.set_step(step)  # Identifying speakers
-                speaker_turns = _diarize_standalone(audio_path)
+                speaker_turns = _diarize_standalone(transcribe_path)
                 gc.collect()
                 mx.clear_cache()
                 step += 1
 
             progress.set_step(step)  # Transcribing
-            if _is_parakeet(model_name):
-                result = _transcribe_parakeet(transcribe_path, model_name)
-            else:
-                result = _transcribe_mlx(transcribe_path, model_name, language,
-                                         word_timestamps=not diarize_enabled)
+            result = _transcribe_audio(transcribe_path, model_name, language,
+                                       word_timestamps=not diarize_enabled)
 
             if speaker_turns is not None:
                 result["segments"] = _assign_speakers_to_segments(
@@ -2279,18 +2298,10 @@ def cmd_run(args):
                 print(f"  💡 Re-run with --no-diarize to use the transcription without speakers.")
         return
     finally:
-        # Clean up denoised temp file
-        if denoised_path and denoised_path != audio_path:
-            try:
-                os.unlink(denoised_path)
-            except OSError:
-                pass
-        # Clean up normalized temp file
-        if normalized_path:
-            try:
-                os.unlink(normalized_path)
-            except OSError:
-                pass
+        _cleanup_temp_files(
+            denoised_path if denoised_path != audio_path else None,
+            normalized_path,
+        )
 
     progress.stop()
 
@@ -2298,30 +2309,11 @@ def cmd_run(args):
     cp_path = _save_checkpoint(result, audio_path, title)
 
     try:
-        # Rename speaker IDs to "Speaker 1", "Speaker 2", etc.
-        speaker_names = _rename_speakers(result)
-
-        # Save transcript
         total_time = time.time() - progress.start_time
-        date_str = extract_recording_date(audio_path)
-        metadata = {
-            "model": model_name,
-            "engine": "mlx",
-            "language": language,
-            "audio_duration": audio_duration,
-            "processing_time": total_time,
-            "audio_file": Path(audio_path).name,
-        }
-        markdown = format_transcript(result, title, speaker_names, date_str, metadata)
-        SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-        safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
-        output_file = SCRIPTS_DIR / f"{date_str} {safe_title}.md"
-        saved_to = _safe_write_text(output_file, markdown, description="transcript")
-        if saved_to:
-            output_file = saved_to
-
-        _remove_checkpoint(cp_path)
+        output_file, speaker_names = _save_transcript(
+            result, audio_path, title, model_name, language,
+            audio_duration, total_time, cp_path,
+        )
 
         # Speed ratio: how fast compared to audio length
         speed_ratio = audio_duration / total_time if total_time > 0 else 0

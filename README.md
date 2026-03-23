@@ -19,18 +19,18 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - **Parakeet CTC engine** — default model that cannot hallucinate (no "Thank Thank Thank..." on silence)
 - **Proper punctuation and capitalization** — out of the box, no post-processing needed
 - **Whisper fallback** — 4 Whisper models available for multilingual or low-RAM setups
-- **Spectral subtraction denoising** — automatic background noise removal for Whisper models
+- **Audio normalization** — peak-headroom-aware volume normalization before transcription (configurable)
 - **Hallucination protection** — silence threshold detection skips fake text in Whisper output
 - **99 languages** — via Whisper models (Parakeet supports English + 25 European languages)
 - **Multiple formats** — MP3, WAV, M4A, OGG, FLAC, WebM
 
 ### Recording
-- **System audio + mic** — captures both sides of Zoom, Teams, Meet via ScreenCaptureKit (no BlackHole needed)
+- **System audio + mic** — captures both sides of Zoom, Teams, Meet via ScreenCaptureKit
 - **No virtual devices** — volume keys work normally, no Audio MIDI Setup configuration
 - **Live mode** — transcribe during the call so the transcript is ready when you hang up
 - **Pause/resume** — press P to pause recording (audio is discarded while paused)
 - **Silence detection** — auto-stops recording when the meeting ends or audio goes quiet
-- **Adaptive scaling** — live mode adjusts chunk size and frequency based on system load
+- **Adaptive scaling** — live mode adjusts chunk frequency based on system load
 - **Waveform display** — live unicode waveform with quality indicators during recording
 - **System health monitoring** — warns when CPU or RAM usage exceeds 85%
 
@@ -91,7 +91,7 @@ System audio capture uses **ScreenCaptureKit** (macOS 12.3+) — no virtual audi
 
 **System Settings → Privacy & Security → Screen Recording** → enable your terminal app.
 
-That's it. No BlackHole, no Multi-Output Device, no Audio MIDI Setup. Volume keys work normally.
+That's it. Volume keys work normally.
 
 ## Usage
 
@@ -132,11 +132,11 @@ The transcript is saved as Markdown to your configured output folder.
 
 | Flag | Example | What it does |
 |------|---------|-------------|
-| `-m` | `-m turbo` | Use a different model (default: parakeet) |
+| `-m` | `-m medium` | Use a different model (default: parakeet) |
 | `-t` | `-t "Team Meeting"` | Set the transcript title |
 | `-l` | `-l ar` | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
 | `--no-diarize` | | Skip speaker identification (faster) |
-| `--no-denoise` | | Skip audio denoising (Whisper models only) |
+| `--denoise` | | Enable spectral subtraction denoising (off by default) |
 
 **Examples:**
 
@@ -148,10 +148,10 @@ transcribe run ~/Downloads/episode.mp3 -t "Episode 42" --no-diarize
 transcribe run ~/Downloads/meeting.m4a -t "Q1 Review"
 
 # Lecture in Arabic
-transcribe run ~/Downloads/lecture.wav -m small -l ar
+transcribe run ~/Downloads/lecture.wav -m medium -l ar
 
-# Fast mode — no speaker identification
-transcribe run ~/Downloads/call.mp3 --no-diarize
+# Noisy recording — enable denoising
+transcribe run ~/Downloads/noisy_call.mp3 --denoise
 ```
 
 ### Live Mode
@@ -165,7 +165,7 @@ transcribe live -t "Team Standup"            # Set title
 transcribe live --no-diarize                 # Skip speaker identification
 ```
 
-**Adaptive scaling:** If your machine is struggling, live mode automatically increases the interval between chunks, reduces batch size, or falls back to record-only mode (transcribes after the call ends).
+**Adaptive scaling:** If your machine is struggling, live mode automatically increases the interval between chunks or falls back to record-only mode (transcribes after the call ends).
 
 Audio quality indicators show during recording — green/yellow/red for mic and system audio levels.
 
@@ -193,15 +193,15 @@ Filter which calendars to watch in `config.json`.
 
 The default model is **Parakeet TDT 0.6B** — a CTC-based model from NVIDIA NeMo. Whisper models are available as alternatives.
 
-| Model | Type | Speed | Size | Denoise | Notes |
-|-------|------|-------|------|---------|-------|
-| **parakeet** | **CTC** | **~17x RT** | **~2.5GB** | **not needed** | **Default — best accuracy + speed, no hallucinations** |
-| small.en | Whisper | ~16x RT | ~460MB | auto | Fast, low RAM, English-only |
-| medium | Whisper | ~8x RT | ~1.5GB | auto | Balanced, multilingual (99 languages) |
-| turbo | Whisper | ~12x RT | ~1.6GB | auto | Fast + accurate, multilingual |
-| large-v3 | Whisper | ~4x RT | ~3GB | auto | Most capable Whisper (slow, high RAM) |
+| Model | Type | Speed | RAM | Notes |
+|-------|------|-------|-----|-------|
+| **parakeet** | **CTC** | **~15x RT** | **~2.5GB** | **Default — best accuracy + speed, no hallucinations** |
+| small.en | Whisper | ~15x RT | ~460MB | Low RAM, English-only |
+| medium | Whisper | ~7x RT | ~1.5GB | Balanced, multilingual (99 languages) |
+| turbo | Whisper | ~3x RT | ~800MB | Slow on MLX despite the name |
+| large-v3 | Whisper | ~4x RT | ~3GB | Most capable Whisper (slow, high RAM) |
 
-Speed measured on M1 16GB. RT = realtime (17x means a 1-hour file transcribes in ~3.5 min). Speaker diarization is enabled by default for all models. Denoising is automatic for Whisper models (Parakeet's CTC architecture handles noise natively).
+Speed measured on M1 16GB. RT = realtime (15x means a 1-hour file transcribes in ~4 min). RAM is auto-checked — you'll get a warning if your free memory is close to what the model needs.
 
 ### Why Parakeet over Whisper?
 
@@ -209,36 +209,13 @@ Parakeet uses CTC (Connectionist Temporal Classification) — it maps audio fram
 
 Parakeet also produces properly punctuated, capitalized text out of the box.
 
-### Accuracy
-
-**Speaker diarization** (who said what) is enabled by default for all models — not just Parakeet. Disable with `--no-diarize` for faster processing without speaker labels.
-
-Evaluated on a 37-minute recording (4 speakers, background noise, ~60s silence at start). Scored independently by two human evaluators listening to the reference audio. All times on M1 16GB. Diarization was tested with Parakeet (rows 1-2); Whisper rows were tested without diarization to isolate transcription quality.
-
-| Rank | Score /10 | Model | Speed | Hallucinations | Stability | Notes |
-|------|-----------|-------|-------|----------------|-----------|-------|
-| 1 | **9.5** | **Parakeet + diarize** | **129s (~17x RT)** | **None** | **Stable** | Best fidelity, proper punctuation and caps |
-| 2 | 9.0 | Parakeet, no diarize | 129s (~17x RT) | None | Stable | Same text quality, no speaker labels |
-| 3 | 7.5 | Whisper medium | ~275s (~8x RT) | Moderate | OK | Lexical substitutions ("flip-flops", "CHI") |
-| 4 | 6.5 | Whisper + denoising | ~170s (~13x RT) | Some at start | OK | "DAVID" hallucinations in opening silence |
-| 5 | 6.0 | Whisper large-v3.en | ~550s (~4x RT) | Low | Unstable | Skipped first 6.5 min entirely |
-| 6 | 5.5 | Whisper turbo | ~180s (~12x RT) | Severe at start | Unstable | First minutes corrupted by looping tokens |
-| 7 | 4.5 | Whisper small | ~140s (~16x RT) | Severe | Unstable | Got stuck in hallucination loop on raw audio |
-
-**Key columns:**
-- **Hallucinations** — Whisper generates fake text during silence/noise. Parakeet's CTC architecture makes this impossible.
-- **Stability** — Whisper turbo/small can enter infinite hallucination loops on noisy audio and never finish. Parakeet always completes.
-
-**When to choose what:**
+### When to choose what
 
 | Use case | Model | Why |
 |----------|-------|-----|
-| **General use** | `parakeet` (default) | Best accuracy, no hallucinations, always stable |
+| **General use** | `parakeet` (default) | Best accuracy, no hallucinations, fastest |
 | **Low RAM (< 8GB free)** | `small.en` | Only 460MB vs 2.5GB |
-| **Non-English** | `medium` or `turbo` | 99 languages via Whisper |
-| **Technical jargon** | `turbo` | Larger vocabulary, but needs denoising |
-
-When using Whisper models, hallucination mitigation is enabled by default (silence threshold + spectral subtraction denoising). Disable denoising with `--no-denoise`.
+| **Non-English** | `medium` | 99 languages via Whisper |
 
 ## Output
 
@@ -290,89 +267,75 @@ Any value you omit uses the built-in default.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `default_model` | `"parakeet"` | Which model to use. `"parakeet"` for best accuracy, or Whisper: `"small.en"`, `"medium"`, `"turbo"`, `"large-v3"` |
-| `language` | `"en"` | Language code. Set explicitly to avoid misdetection. [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
-| `auto_title_from_calendar` | `true` | When recording during a calendar event, use the event name as the transcript title |
+| `default_model` | `"parakeet"` | Which model to use |
+| `language` | `"en"` | Language code ([99 languages supported](https://github.com/openai/whisper#available-models-and-languages)) |
+| `auto_title_from_calendar` | `true` | Use calendar event name as transcript title |
 
-### Whisper Settings
+### Audio Normalization
 
-Only applies when using a Whisper model (not parakeet).
+Volume normalization before transcription. Scales audio to consistent level with peak headroom to prevent clipping. Stereo channels are normalized independently.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `whisper.hallucination_silence_threshold` | `2.0` | Seconds of silence before Whisper's output is checked for hallucination. When detected, the segment is skipped. Set to `null` to disable |
+| `normalize.enabled` | `true` | Normalize audio volume before transcription |
+| `normalize.target_rms` | `0.05` | Target RMS level (~-26 dBFS) |
+| `normalize.peak_headroom_db` | `1.0` | Keep peaks below -1 dBFS to prevent clipping |
 
 ### Audio Denoising
 
-Spectral subtraction pre-processing. Only applies to Whisper models — Parakeet skips this automatically since CTC can't hallucinate on silence.
+Spectral subtraction pre-processing. **Off by default** — eval tests showed all models handle noise well without it. Enable with `--denoise` flag for recordings with heavy constant background noise that start with silence.
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `denoise.enabled` | `true` | Whether to denoise audio before Whisper transcription. Subtracts background noise using the first N seconds as a noise profile |
-| `denoise.factor` | `2.0` | How aggressively to remove noise. Higher = more removal but risks distorting speech. 2.0 is a good balance |
-| `denoise.noise_profile_seconds` | `10` | How many seconds from the start of the audio to use as a noise sample. Works best when the recording starts with silence or hold music |
+| `denoise.enabled` | `false` | Enable denoising (or use `--denoise` flag) |
+| `denoise.factor` | `2.0` | Noise subtraction aggressiveness. Higher = more removal but risks distortion |
+| `denoise.noise_profile_seconds` | `10` | Seconds from start of audio used as noise sample. Works best when recording starts with silence |
 
 ### Paths
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `paths.obsidian_base` | `"~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Sessions"` | Root folder where recordings and transcripts are saved |
-| `paths.recordings_subdir` | `"Recordings"` | Subfolder for audio files within the base path |
+| `paths.obsidian_base` | `"~/Library/Mobile Documents/..."` | Root folder for recordings and transcripts |
+| `paths.recordings_subdir` | `"Recordings"` | Subfolder for audio files |
 | `paths.scripts_subdir` | `"Scripts"` | Subfolder for transcript Markdown files |
 
 ### Recording
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `recording.silence_threshold` | `0.005` | RMS audio level below which the signal is considered silence. Lower = more sensitive |
-| `recording.silence_timeout_minutes` | `10` | Stop recording after this many minutes of continuous silence |
-| `recording.mic_low_warning_seconds` | `10` | Show a warning if mic input stays very low for this many seconds |
+| `recording.silence_threshold` | `0.005` | RMS level below which signal is silence. Lower = more sensitive |
+| `recording.silence_timeout_minutes` | `10` | Stop recording after this many minutes of silence |
+| `recording.mic_low_warning_seconds` | `10` | Warn if mic stays very low for this long |
+| `recording.virtual_device_names` | `["Aggregate", "Multi-Output"]` | Virtual audio devices to exclude from mic selection |
 
 ### Speaker Diarization
 
-Uses Sortformer on Apple GPU (max 4 speakers per channel).
-
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `diarization.enabled` | `true` | Whether to identify individual speakers in the transcript |
-| `diarization.threshold` | `0.5` | Speaker detection sensitivity (0-1). Lower catches more speech but may produce false detections |
-| `diarization.min_duration` | `0.0` | Ignore speaker segments shorter than this (seconds). Filters micro-segments and blips |
-| `diarization.merge_gap` | `0.0` | Merge segments from the same speaker that are closer than this gap (seconds). Reduces fragmentation |
+| `diarization.enabled` | `true` | Identify individual speakers |
+| `diarization.threshold` | `0.5` | Speaker detection sensitivity (0-1) |
+| `diarization.min_duration` | `0.0` | Ignore speaker segments shorter than this (seconds) |
+| `diarization.merge_gap` | `0.0` | Merge same-speaker segments closer than this gap (seconds) |
 
 ### Live Mode
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `live.model` | `"small.en"` | Model for real-time transcription during recording. Uses a lighter model than post-recording for speed |
+| `live.model` | `"parakeet"` | Model for real-time transcription |
 | `live.chunk_interval_seconds` | `120` | How often to transcribe accumulated audio (seconds) |
-| `live.min_chunk_interval` | `60` | Shortest interval the adaptive system will use (seconds) |
-| `live.max_chunk_interval` | `300` | Longest interval before the adaptive system gives up and switches to record-only |
-| `live.chunk_overlap_seconds` | `5` | Seconds of overlap between consecutive chunks to avoid cutting words at boundaries |
-| `live.min_chunk_seconds` | `30` | Minimum audio length before a chunk is worth transcribing |
-| `live.struggle_ratio` | `0.7` | If transcription takes longer than this ratio of the chunk duration, increase the interval |
-| `live.rec_only_ratio` | `1.5` | If transcription takes longer than this ratio, stop transcribing and just record |
+| `live.struggle_ratio` | `0.7` | If transcription takes longer than this ratio, slow down |
+| `live.rec_only_ratio` | `1.5` | If transcription takes longer than this ratio, stop and just record |
 
 ### Calendar Watch
 
 | Key | Default | What it does |
 |-----|---------|--------------|
-| `watch.model` | `"parakeet"` | Model to use for auto-transcription after a watched recording finishes |
-| `watch.calendars` | `[]` | Only watch these calendar names. Empty = watch all calendars |
-| `watch.silence_timeout_minutes` | `10` | Stop auto-recording after this many minutes of silence |
-| `watch.min_recording_minutes` | `2` | Discard auto-recordings shorter than this. Catches non-meeting calendar events |
-| `watch.end_buffer_minutes` | `2` | Keep recording for N minutes after the calendar event ends. Catches meetings that run over |
-| `watch.refresh_hours` | `3` | Re-read the calendar every N hours to pick up newly added meetings |
-| `watch.record_only` | `true` | `true` = record during the meeting, transcribe after. `false` = live-transcribe during the meeting |
-
-### Batch Sizes
-
-Per-model batch sizes for adaptive chunking in live mode. Tuned for M1 16GB:
-
-```json
-"batch_sizes": { "small.en": 16, "medium": 8, "turbo": 4, "large-v3": 4 }
-```
-
-Reduce if you get memory errors. Increase on machines with more RAM. Not used by the MLX engine.
+| `watch.model` | `"parakeet"` | Model for auto-transcription |
+| `watch.calendars` | `[]` | Calendar names to watch. Empty = all |
+| `watch.silence_timeout_minutes` | `10` | Stop recording after silence |
+| `watch.min_recording_minutes` | `2` | Discard recordings shorter than this |
+| `watch.end_buffer_minutes` | `2` | Keep recording N minutes after event ends |
+| `watch.record_only` | `true` | Record during meeting, transcribe after |
 
 ## Troubleshooting
 
