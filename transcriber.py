@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     # ── General ──────────────────────────────────────────────────────────
     # Transcription model: "parakeet" (recommended) or Whisper variants
     # Parakeet: CTC model — no hallucinations, proper punctuation, 2.5GB
-    # Whisper: small.en, medium, turbo, large-v3
+    # Whisper: small.en, medium, large-v3
     "default_model": "parakeet",
     # Language code for transcription (e.g. "en", "ar", "fr")
     "language": "en",
@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     # Higher = faster but more RAM. These are tuned for M1 16GB.
     # Reduce if you get memory errors; increase on machines with more RAM.
     "batch_sizes": {
-        "small.en": 16, "medium": 8, "turbo": 4, "large-v3": 4
+        "small.en": 16, "medium": 8, "large-v3": 4
     },
 
     # ── File paths ───────────────────────────────────────────────────────
@@ -124,9 +124,8 @@ DEFAULT_CONFIG = {
 
     # ── Live mode (record + transcribe simultaneously) ───────────────────
     "live": {
-        # Model for live mode — use a lighter model for real-time processing
-        # The heavier default_model is used for post-recording transcription (cmd_run)
-        "model": "small.en",
+        # Model for live mode — parakeet is fast enough for real-time (15x real-time on M1)
+        "model": "parakeet",
         # Seconds between transcription chunks during recording
         # Lower = more real-time but more CPU. Recommended: 120
         "chunk_interval_seconds": 120,
@@ -205,11 +204,10 @@ DEFAULT_CONFIG = {
     # speed_factor: multiplier for time estimation (audio_duration × factor)
     # Lower = faster model. These are calibrated for M1 Apple Silicon.
     "models": {
-        "parakeet":  {"speed_factor": 0.5, "description": "best accuracy + speed, no hallucinations ★", "size": "~2.5GB"},
-        "small.en":  {"speed_factor": 0.5, "description": "fast, low RAM, English-only",               "size": "~460MB"},
-        "medium":    {"speed_factor": 1.5, "description": "balanced, multilingual (99 languages)",      "size": "~1.5GB"},
-        "turbo":     {"speed_factor": 0.8, "description": "fast + accurate, multilingual",              "size": "~1.6GB"},
-        "large-v3":  {"speed_factor": 4.0, "description": "most capable Whisper (slow, high RAM)",      "size": "~3GB"},
+        "parakeet":  {"speed_factor": 0.5, "description": "Best Accuracy and speed (English) ★", "size": "~2.5GB"},
+        "small.en":  {"speed_factor": 0.5, "description": "Fast, low RAM, English-only",               "size": "~460MB"},
+        "medium":    {"speed_factor": 1.5, "description": "Balanced Multilingual", "size": "~1.5GB"},
+        "large-v3":  {"speed_factor": 4.0, "description": "More capable Multilingual - slow",      "size": "~3GB"},
     },
 
     # ── MLX model repos (HuggingFace) ────────────────────────────────
@@ -218,7 +216,6 @@ DEFAULT_CONFIG = {
         "parakeet":  "mlx-community/parakeet-tdt-0.6b-v3",
         "small.en":  "mlx-community/whisper-small.en-mlx",
         "medium":    "mlx-community/whisper-medium-mlx",
-        "turbo":     "mlx-community/whisper-large-v3-turbo",
         "large-v3":  "mlx-community/whisper-large-v3-mlx",
     },
 }
@@ -651,6 +648,8 @@ def cmd_history(args):
         print(f"  {'Model':<14} {'Runs':>5} {'Avg Speed':>10} {'Min':>7} {'Max':>7}")
         print(f"  {'─'*14} {'─'*5} {'─'*10} {'─'*7} {'─'*7}")
         for model, speeds in sorted(model_stats.items()):
+            if not speeds:
+                continue
             avg = sum(speeds) / len(speeds)
             print(f"  {model:<14} {len(speeds):>5} {avg:>9.1f}x {min(speeds):>6.1f}x {max(speeds):>6.1f}x")
 
@@ -1565,6 +1564,7 @@ class ProgressTracker:
         self._thread = None
         self._live = Live("", console=console, auto_refresh=False)
         self._completed = []  # [(name, duration_str)]
+        self._step_times = {}
         self.step_names = STEP_NAMES  # can be overridden before start()
         # Keep step_weights for compatibility (used by callers for estimated_total)
         # MLX + Sortformer: transcription dominates time
@@ -1575,14 +1575,14 @@ class ProgressTracker:
         self.estimated_total = max(10, audio_duration * speed_factor + diar_time)
 
     def start(self):
-        self._step_times = {}
+        self._step_times.clear()
         self._live.__enter__()
         self._thread = threading.Thread(target=self._display_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         # Record final step
-        if hasattr(self, '_step_times') and self.current_step not in self._step_times:
+        if self.current_step not in self._step_times:
             self._step_times[self.current_step] = time.time() - self.step_start_time
             name = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "Step"
             self._completed.append((name, format_duration(self._step_times[self.current_step])))
@@ -1594,7 +1594,7 @@ class ProgressTracker:
         self._live.__exit__(None, None, None)
 
     def set_step(self, step_index):
-        if hasattr(self, '_step_times') and self.current_step < step_index:
+        if self.current_step < step_index:
             prev_elapsed = time.time() - self.step_start_time
             self._step_times[self.current_step] = prev_elapsed
             prev_name = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "Step"
@@ -1656,8 +1656,10 @@ def _split_stereo(audio_path, sr=16000):
         return None, None  # mono file
     mic = data[:, 0]
     sys_audio = data[:, 1]
-    mic_path = tempfile.mktemp(suffix="_mic.wav")
-    sys_path = tempfile.mktemp(suffix="_sys.wav")
+    mic_fd, mic_path = tempfile.mkstemp(suffix="_mic.wav")
+    sys_fd, sys_path = tempfile.mkstemp(suffix="_sys.wav")
+    os.close(mic_fd)
+    os.close(sys_fd)
     sf.write(mic_path, mic, file_sr, subtype="PCM_16")
     sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
     _log("split", duration=f"{len(mic)/file_sr:.1f}s",
@@ -1730,6 +1732,8 @@ def _load_audio(path, sr=16000):
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed to load {path}: {result.stderr.decode()[:200]}")
     audio = np.frombuffer(result.stdout, dtype=np.float32)
+    if len(audio) == 0:
+        raise RuntimeError(f"ffmpeg produced empty audio for {path}")
     _log("load", file=Path(path).name, sr=sr, duration=f"{len(audio)/sr:.1f}s",
          rms=f"{np.sqrt(np.mean(audio**2)):.5f}", peak=f"{np.max(np.abs(audio)):.3f}")
     return audio
@@ -1737,6 +1741,9 @@ def _load_audio(path, sr=16000):
 
 def _stft(audio, n_fft=2048, hop_length=512):
     """Short-time Fourier Transform using numpy. Returns complex array (freq_bins, frames)."""
+    if len(audio) < n_fft:
+        # Pad short audio to n_fft length
+        audio = np.pad(audio, (0, n_fft - len(audio)))
     window = np.hanning(n_fft)
     n_frames = 1 + (len(audio) - n_fft) // hop_length
     frames = np.stack([audio[i * hop_length:i * hop_length + n_fft] * window for i in range(n_frames)])
@@ -1822,6 +1829,12 @@ def _denoise_audio(audio_path):
     except Exception as e:
         _log("denoise", error=str(e))
         print(f"  ⚠  Denoising failed ({e}), using original audio")
+        # Clean up partial temp file if it was created
+        if 'tmp_path' in locals():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         return audio_path, 0
 
 
@@ -2063,7 +2076,7 @@ def cmd_run(args):
     denoise_factor = config.get("denoise", {}).get("factor", 2.0)
 
     is_stereo_input = _is_stereo(audio_path)
-    engine_label = "parakeet (GPU)" if is_parakeet_model else "mlx (GPU)"
+    engine_label = "mlx-audio (GPU)" if is_parakeet_model else "mlx-whisper (GPU)"
     model_size = MODEL_INFO.get(model_name, {}).get("size", "?")
     diar_label = "Sortformer (GPU)" if diarize_enabled else "off"
     denoise_label = f"spectral sub {denoise_factor}x" if denoise_enabled else "off"
@@ -2210,7 +2223,8 @@ def cmd_run(args):
                     # Prefix local speakers to distinguish from remote
                     for seg in mic_result.get("segments", []):
                         if seg.get("speaker", "").startswith("SPEAKER_"):
-                            num = int(seg["speaker"].split("_")[1]) + 1
+                            parts = seg["speaker"].split("_")
+                            num = int(parts[1]) + 1 if len(parts) > 1 and parts[1].isdigit() else 1
                             seg["speaker"] = f"Local {num}"
                 else:
                     # Default: mic = "You"
@@ -2805,12 +2819,20 @@ def cmd_watch(args):
             if proc.poll() is None:
                 _watch_log(f"⏹  \"{next_event['title']}\" ended + {end_buffer}min buffer — stopping")
                 proc.send_signal(signal.SIGINT)
-                proc.wait(timeout=300)
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
 
         except KeyboardInterrupt:
             if proc.poll() is None:
                 proc.send_signal(signal.SIGINT)
-                proc.wait(timeout=300)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
             _watch_log("👋 Watch stopped by user")
             return
 

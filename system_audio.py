@@ -132,7 +132,7 @@ if _AVAILABLE:
                 try:
                     capture._callback(pcm.reshape(-1, 1), len(pcm), None, None)
                 except Exception:
-                    pass  # absorb sd.CallbackAbort and other signals
+                    pass  # absorb sd.CallbackAbort from recording stop signals
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
