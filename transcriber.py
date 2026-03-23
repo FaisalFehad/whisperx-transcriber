@@ -1806,9 +1806,12 @@ def _istft(stft_matrix, hop_length=512, length=None):
 def _denoise_audio(audio_path):
     """Apply spectral subtraction denoising to an audio file.
 
-    Uses the first N seconds as a noise profile, then subtracts scaled noise
-    power from the entire signal.  Writes a denoised WAV to a temp file and
-    returns its path.  The caller is responsible for cleanup.
+    Finds the quietest N-second window in the audio as a noise profile,
+    then subtracts scaled noise power from the entire signal. Falls back
+    to the first N seconds if the audio is shorter than 2x the profile.
+
+    Writes a denoised WAV to a temp file and returns its path.
+    The caller is responsible for cleanup.
 
     Returns (denoised_path, elapsed_seconds) or (original_path, 0) if
     denoising is disabled or fails.
@@ -1827,7 +1830,25 @@ def _denoise_audio(audio_path):
         t0 = time.time()
         audio = _load_audio(audio_path, sr=sr)
 
-        noise_clip = audio[: sr * profile_secs]
+        # Find the quietest window for noise profile instead of blindly
+        # using the first N seconds (which may contain speech)
+        profile_samples = sr * profile_secs
+        if len(audio) > profile_samples * 2:
+            # Slide a window across the audio, find lowest RMS
+            step = sr  # check every 1 second
+            best_rms = float("inf")
+            best_start = 0
+            for start in range(0, len(audio) - profile_samples, step):
+                window = audio[start:start + profile_samples]
+                rms = float(np.sqrt(np.mean(window ** 2)))
+                if rms < best_rms:
+                    best_rms = rms
+                    best_start = start
+            noise_clip = audio[best_start:best_start + profile_samples]
+            _log("denoise", profile=f"quietest window at {best_start/sr:.1f}s (rms={best_rms:.5f})")
+        else:
+            noise_clip = audio[:profile_samples]
+
         n_fft = denoise_cfg.get("n_fft", 2048)
         hop = denoise_cfg.get("hop_length", 512)
 
