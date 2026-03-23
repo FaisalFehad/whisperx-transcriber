@@ -1,21 +1,13 @@
-# Transcriber
+# Local-Transcriber
 
-Local speech-to-text for macOS. Record meetings, lectures, podcasts, or any audio — get accurate transcripts with speaker labels, saved as Markdown.
-
-Everything runs on your Mac's GPU. No audio leaves your machine.
-
-## Why Local?
-
-Cloud transcription services (Otter, Rev, Fireflies) upload your audio to remote servers. That's a problem for:
-- **Confidential conversations** — legal, medical, HR, financial discussions
-- **NDA-bound meetings** — client calls, partner discussions, internal strategy
-- **Personal recordings** — therapy sessions, journaling, private conversations
+Lightweight simple local speech-to-text for macOS. Record meetings, lectures, podcasts, or any audio — get accurate transcripts with speaker labels, blazing fast, no subscriptions, no data leaving your machine.
 
 This tool processes everything on-device using Apple Silicon GPU acceleration. Your audio stays on your disk, your transcripts stay in your vault. No accounts, no subscriptions, no data sharing.
 
 ## Features
 
 ### Transcription
+
 - **Parakeet CTC engine** — default model that cannot hallucinate (no "Thank Thank Thank..." on silence)
 - **Proper punctuation and capitalization** — out of the box, no post-processing needed
 - **Whisper fallback** — 4 Whisper models available for multilingual or low-RAM setups
@@ -24,7 +16,8 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - **99 languages** — via Whisper models (Parakeet supports English + 25 European languages)
 - **Multiple formats** — MP3, WAV, M4A, OGG, FLAC, WebM
 
-### Recording
+### Recording (configurable)
+
 - **System audio + mic** — captures both sides of Zoom, Teams, Meet via ScreenCaptureKit
 - **No virtual devices** — volume keys work normally, no Audio MIDI Setup configuration
 - **Live mode** — transcribe during the call so the transcript is ready when you hang up
@@ -35,22 +28,26 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - **System health monitoring** — warns when CPU or RAM usage exceeds 85%
 
 ### Speaker Identification
+
 - **Speaker diarization** — identifies who said what using Sortformer on Apple GPU
 - **Up to 4 speakers** per channel — automatically separated and labeled
 - **Configurable sensitivity** — tune detection threshold, minimum duration, and merge gap
 
 ### Automation
+
 - **Calendar watch** — auto-record meetings from macOS Calendar
 - **Background daemon** — runs as a launchd service, survives terminal close and reboots
 - **Smart filtering** — watch specific calendars, discard recordings under 2 minutes
 - **Auto-title** — pulls meeting title from your calendar event
 
 ### Output
+
 - **Markdown with YAML frontmatter** — ready for Obsidian, Logseq, or any Markdown tool
 - **Timestamps and speaker labels** — `**[00:00] Alice:** ...` format
 - **Configurable paths** — save to any folder, not just Obsidian
 
 ### Privacy
+
 - **Fully local** — all processing on Apple Silicon GPU, no cloud APIs
 - **No accounts** — no sign-ups, no API keys (except free HF token for diarization)
 - **No telemetry** — nothing phones home
@@ -58,18 +55,20 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 
 ## Requirements
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
+- macOS with Apple Silicon
 - Python 3.10+
-- ffmpeg (`brew install ffmpeg`)
 - Screen Recording permission (macOS prompts on first use — needed for system audio capture via ScreenCaptureKit)
 
 ## Install
 
 ```bash
-git clone https://github.com/FaisalFehad/whisperx-transcriber.git
-cd whisperx-transcriber
-./install.sh
-source ~/.zshrc
+    git clone https://github.com/FaisalFehad/whisperx-transcriber.git
+    cd whisperx-transcriber
+
+    ./install.sh
+    source ~/.zshrc
+
+    transcribe rec # To transcribe live system and external audio, Control + C to stop recording and save
 ```
 
 The installer creates a virtual environment, installs dependencies, and adds the `transcribe` command to your shell.
@@ -81,6 +80,7 @@ Speaker identification requires a free Hugging Face token:
 1. Create a free account at [huggingface.co](https://huggingface.co)
 2. Generate a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
 3. Add to your shell:
+
    ```bash
    echo 'export HF_TOKEN=your_token_here' >> ~/.zshrc
    ```
@@ -91,14 +91,12 @@ System audio capture uses **ScreenCaptureKit** (macOS 12.3+) — no virtual audi
 
 **System Settings → Privacy & Security → Screen Recording** → enable your terminal app.
 
-That's it. Volume keys work normally.
-
 ## Usage
 
 ### Quick Start
 
 ```bash
-transcribe run ~/Downloads/recording.mp3    # Transcribe any audio file
+transcribe run ~/Downloads/recording.mp3     # Transcribe any audio file
 transcribe rec                               # Record system audio + mic
 transcribe run                               # Transcribe last recording
 transcribe live                              # Record + transcribe simultaneously
@@ -106,23 +104,25 @@ transcribe live                              # Record + transcribe simultaneousl
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `transcribe run [file]` | Transcribe an audio file or last recording |
-| `transcribe rec` | Record audio (auto-stops after silence) |
-| `transcribe live` | Record + transcribe at the same time |
-| `transcribe list` | Browse past recordings |
-| `transcribe watch` | Auto-record meetings from calendar |
-| `transcribe install-daemon` | Run calendar watch as background service |
-| `transcribe uninstall-daemon` | Remove background service |
-| `transcribe watch-status` | Check if watch daemon is running |
-| `transcribe setup` | Audio device setup guide |
+| Command                       | Description                                |
+| ----------------------------- | ------------------------------------------ |
+| `transcribe run [file]`       | Transcribe an audio file or last recording |
+| `transcribe rec`              | Record audio (auto-stops after silence)    |
+| `transcribe live`             | Record + transcribe at the same time       |
+| `transcribe list`             | Browse past recordings                     |
+| `transcribe watch`            | Auto-record meetings from calendar         |
+| `transcribe install-daemon`   | Run calendar watch as background service   |
+| `transcribe uninstall-daemon` | Remove background service                  |
+| `transcribe watch-status`     | Check if watch daemon is running           |
+| `transcribe setup`            | Audio device setup guide                   |
 
 ### Transcribe an Audio File
 
 Supported formats: **MP3, WAV, M4A, OGG, FLAC, WebM**.
 
+
 ```bash
+# To transcribe an existing file
 transcribe run ~/Downloads/recording.mp3
 ```
 
@@ -130,13 +130,13 @@ The transcript is saved as Markdown to your configured output folder.
 
 **Options:**
 
-| Flag | Example | What it does |
-|------|---------|-------------|
-| `-m` | `-m medium` | Use a different model (default: parakeet) |
-| `-t` | `-t "Team Meeting"` | Set the transcript title |
-| `-l` | `-l ar` | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
-| `--no-diarize` | | Skip speaker identification (faster) |
-| `--denoise` | | Enable spectral subtraction denoising (off by default) |
+| Flag           | Example             | What it does                                                                                                            |
+| -------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `-m`           | `-m medium`         | Use a different model (default: parakeet)                                                                               |
+| `-t`           | `-t "Team Meeting"` | Set the transcript title                                                                                                |
+| `-l`           | `-l ar`             | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
+| `--no-diarize` |                     | Skip speaker identification (faster)                                                                                    |
+| `--denoise`    |                     | Enable spectral subtraction denoising (off by default)                                                                  |
 
 **Examples:**
 
@@ -180,7 +180,8 @@ transcribe watch-status            # Check daemon status
 transcribe uninstall-daemon        # Remove background service
 ```
 
-**How it works:**
+**Apple Calendar integration (Optional):**
+
 1. Reads your macOS Calendar on launch and every few hours
 2. Sleeps until the next meeting (zero CPU while waiting)
 3. Starts recording when a meeting begins
@@ -193,13 +194,13 @@ Filter which calendars to watch in `config.json`.
 
 The default model is **Parakeet TDT 0.6B** — a CTC-based model from NVIDIA NeMo. Whisper models are available as alternatives.
 
-| Model | Type | Speed | RAM | Notes |
-|-------|------|-------|-----|-------|
+| Model        | Type    | Speed       | RAM        | Notes                                                  |
+| ------------ | ------- | ----------- | ---------- | ------------------------------------------------------ |
 | **parakeet** | **CTC** | **~15x RT** | **~2.5GB** | **Default — best accuracy + speed, no hallucinations** |
-| small.en | Whisper | ~15x RT | ~460MB | Low RAM, English-only |
-| medium | Whisper | ~7x RT | ~1.5GB | Balanced, multilingual (99 languages) |
-| turbo | Whisper | ~3x RT | ~800MB | Slow on MLX despite the name |
-| large-v3 | Whisper | ~4x RT | ~3GB | Most capable Whisper (slow, high RAM) |
+| small.en     | Whisper | ~15x RT     | ~460MB     | Low RAM, English-only                                  |
+| medium       | Whisper | ~7x RT      | ~1.5GB     | Balanced, multilingual (99 languages)                  |
+| turbo        | Whisper | ~3x RT      | ~800MB     | Slow on MLX despite the name                           |
+| large-v3     | Whisper | ~4x RT      | ~3GB       | Most capable Whisper (slow, high RAM)                  |
 
 Speed measured on M1 16GB. RT = realtime (15x means a 1-hour file transcribes in ~4 min). RAM is auto-checked — you'll get a warning if your free memory is close to what the model needs.
 
@@ -211,11 +212,11 @@ Parakeet also produces properly punctuated, capitalized text out of the box.
 
 ### When to choose what
 
-| Use case | Model | Why |
-|----------|-------|-----|
-| **General use** | `parakeet` (default) | Best accuracy, no hallucinations, fastest |
-| **Low RAM (< 8GB free)** | `small.en` | Only 460MB vs 2.5GB |
-| **Non-English** | `medium` | 99 languages via Whisper |
+| Use case                 | Model                | Why                                           |
+| ------------------------ | -------------------- | --------------------------------------------- |
+| **General use**          | `parakeet` (default) | Best accuracy, blazing fast no hallucinations |
+| **Low RAM (< 8GB free)** | `small.en`           | Only 460MB - decent alternative parakeet      |
+| **Non-English**          | `medium`             | 99 languages via Whisper                      |
 
 ## Output
 
@@ -265,77 +266,77 @@ Any value you omit uses the built-in default.
 
 ### General
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `default_model` | `"parakeet"` | Which model to use |
-| `language` | `"en"` | Language code ([99 languages supported](https://github.com/openai/whisper#available-models-and-languages)) |
-| `auto_title_from_calendar` | `true` | Use calendar event name as transcript title |
+| Key                        | Default      | What it does                                                                                               |
+| -------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------- |
+| `default_model`            | `"parakeet"` | Which model to use                                                                                         |
+| `language`                 | `"en"`       | Language code ([99 languages supported](https://github.com/openai/whisper#available-models-and-languages)) |
+| `auto_title_from_calendar` | `true`       | Use calendar event name as transcript title                                                                |
 
 ### Audio Normalization
 
 Volume normalization before transcription. Scales audio to consistent level with peak headroom to prevent clipping. Stereo channels are normalized independently.
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `normalize.enabled` | `true` | Normalize audio volume before transcription |
-| `normalize.target_rms` | `0.05` | Target RMS level (~-26 dBFS) |
-| `normalize.peak_headroom_db` | `1.0` | Keep peaks below -1 dBFS to prevent clipping |
+| Key                          | Default | What it does                                 |
+| ---------------------------- | ------- | -------------------------------------------- |
+| `normalize.enabled`          | `true`  | Normalize audio volume before transcription  |
+| `normalize.target_rms`       | `0.05`  | Target RMS level (~-26 dBFS)                 |
+| `normalize.peak_headroom_db` | `1.0`   | Keep peaks below -1 dBFS to prevent clipping |
 
 ### Audio Denoising
 
 Spectral subtraction pre-processing. **Off by default** — eval tests showed all models handle noise well without it. Enable with `--denoise` flag for recordings with heavy constant background noise that start with silence.
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `denoise.enabled` | `false` | Enable denoising (or use `--denoise` flag) |
-| `denoise.factor` | `2.0` | Noise subtraction aggressiveness. Higher = more removal but risks distortion |
-| `denoise.noise_profile_seconds` | `10` | Seconds from start of audio used as noise sample. Works best when recording starts with silence |
+| Key                             | Default | What it does                                                                                    |
+| ------------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `denoise.enabled`               | `false` | Enable denoising (or use `--denoise` flag)                                                      |
+| `denoise.factor`                | `2.0`   | Noise subtraction aggressiveness. Higher = more removal but risks distortion                    |
+| `denoise.noise_profile_seconds` | `10`    | Seconds from start of audio used as noise sample. Works best when recording starts with silence |
 
 ### Paths
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `paths.obsidian_base` | `"~/Library/Mobile Documents/..."` | Root folder for recordings and transcripts |
-| `paths.recordings_subdir` | `"Recordings"` | Subfolder for audio files |
-| `paths.scripts_subdir` | `"Scripts"` | Subfolder for transcript Markdown files |
+| Key                       | Default                            | What it does                               |
+| ------------------------- | ---------------------------------- | ------------------------------------------ |
+| `paths.obsidian_base`     | `"~/Library/Mobile Documents/..."` | Root folder for recordings and transcripts |
+| `paths.recordings_subdir` | `"Recordings"`                     | Subfolder for audio files                  |
+| `paths.scripts_subdir`    | `"Scripts"`                        | Subfolder for transcript Markdown files    |
 
 ### Recording
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `recording.silence_threshold` | `0.005` | RMS level below which signal is silence. Lower = more sensitive |
-| `recording.silence_timeout_minutes` | `10` | Stop recording after this many minutes of silence |
-| `recording.mic_low_warning_seconds` | `10` | Warn if mic stays very low for this long |
-| `recording.virtual_device_names` | `["Aggregate", "Multi-Output"]` | Virtual audio devices to exclude from mic selection |
+| Key                                 | Default                         | What it does                                                    |
+| ----------------------------------- | ------------------------------- | --------------------------------------------------------------- |
+| `recording.silence_threshold`       | `0.005`                         | RMS level below which signal is silence. Lower = more sensitive |
+| `recording.silence_timeout_minutes` | `10`                            | Stop recording after this many minutes of silence               |
+| `recording.mic_low_warning_seconds` | `10`                            | Warn if mic stays very low for this long                        |
+| `recording.virtual_device_names`    | `["Aggregate", "Multi-Output"]` | Virtual audio devices to exclude from mic selection             |
 
 ### Speaker Diarization
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `diarization.enabled` | `true` | Identify individual speakers |
-| `diarization.threshold` | `0.5` | Speaker detection sensitivity (0-1) |
-| `diarization.min_duration` | `0.0` | Ignore speaker segments shorter than this (seconds) |
-| `diarization.merge_gap` | `0.0` | Merge same-speaker segments closer than this gap (seconds) |
+| Key                        | Default | What it does                                               |
+| -------------------------- | ------- | ---------------------------------------------------------- |
+| `diarization.enabled`      | `true`  | Identify individual speakers                               |
+| `diarization.threshold`    | `0.5`   | Speaker detection sensitivity (0-1)                        |
+| `diarization.min_duration` | `0.0`   | Ignore speaker segments shorter than this (seconds)        |
+| `diarization.merge_gap`    | `0.0`   | Merge same-speaker segments closer than this gap (seconds) |
 
 ### Live Mode
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `live.model` | `"parakeet"` | Model for real-time transcription |
-| `live.chunk_interval_seconds` | `120` | How often to transcribe accumulated audio (seconds) |
-| `live.struggle_ratio` | `0.7` | If transcription takes longer than this ratio, slow down |
-| `live.rec_only_ratio` | `1.5` | If transcription takes longer than this ratio, stop and just record |
+| Key                           | Default      | What it does                                                        |
+| ----------------------------- | ------------ | ------------------------------------------------------------------- |
+| `live.model`                  | `"parakeet"` | Model for real-time transcription                                   |
+| `live.chunk_interval_seconds` | `120`        | How often to transcribe accumulated audio (seconds)                 |
+| `live.struggle_ratio`         | `0.7`        | If transcription takes longer than this ratio, slow down            |
+| `live.rec_only_ratio`         | `1.5`        | If transcription takes longer than this ratio, stop and just record |
 
 ### Calendar Watch
 
-| Key | Default | What it does |
-|-----|---------|--------------|
-| `watch.model` | `"parakeet"` | Model for auto-transcription |
-| `watch.calendars` | `[]` | Calendar names to watch. Empty = all |
-| `watch.silence_timeout_minutes` | `10` | Stop recording after silence |
-| `watch.min_recording_minutes` | `2` | Discard recordings shorter than this |
-| `watch.end_buffer_minutes` | `2` | Keep recording N minutes after event ends |
-| `watch.record_only` | `true` | Record during meeting, transcribe after |
+| Key                             | Default      | What it does                              |
+| ------------------------------- | ------------ | ----------------------------------------- |
+| `watch.model`                   | `"parakeet"` | Model for auto-transcription              |
+| `watch.calendars`               | `[]`         | Calendar names to watch. Empty = all      |
+| `watch.silence_timeout_minutes` | `10`         | Stop recording after silence              |
+| `watch.min_recording_minutes`   | `2`          | Discard recordings shorter than this      |
+| `watch.end_buffer_minutes`      | `2`          | Keep recording N minutes after event ends |
+| `watch.record_only`             | `true`       | Record during meeting, transcribe after   |
 
 ## Troubleshooting
 
