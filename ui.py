@@ -112,7 +112,7 @@ def check_system_health(threshold=85):
         if ram > threshold:
             warnings.append(f"RAM {int(ram)}%")
         return " │ ".join(warnings) if warnings else None
-    except ImportError:
+    except Exception:
         return None
 
 
