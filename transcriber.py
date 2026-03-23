@@ -151,7 +151,7 @@ DEFAULT_CONFIG = {
         # Discard recordings shorter than this (catches non-meeting events)
         "min_recording_minutes": 2,
         # Model to use for watch auto-transcription
-        "model": "small",
+        "model": "parakeet",
         # Only watch these calendars (empty = all calendars)
         # Example: ["Work", "Personal"]
         "calendars": [],
@@ -190,8 +190,8 @@ DEFAULT_CONFIG = {
         # Over-subtraction factor: how aggressively to remove noise.
         # 2.0 = balanced (recommended). Higher = more removal but risks speech distortion.
         "factor": 2.0,
-        # Seconds of audio to use as noise profile (from start of file).
-        "noise_profile_seconds": 10,
+        # Seconds of audio to use as noise profile.
+        "noise_profile_seconds": 3,
         # FFT window size and hop for spectral subtraction (advanced)
         "n_fft": 2048,
         "hop_length": 512,
@@ -1124,16 +1124,18 @@ def cmd_live(args):
     no_diarize = getattr(args, "no_diarize", False)
     title = getattr(args, "title", None)
 
-    # ── Pre-load whisper model ────────────────────────────────────────────
+    # ── Pre-load model ──────────────────────────────────────────────────
     from ui import console
     from rich.panel import Panel
     print()
     console.print(Panel("[bold]🎙 Live Record + Transcribe[/bold]", border_style="dim", expand=False, width=54))
     print()
     print(f"  Loading '{model_name}' model...")
-    import mlx_whisper
-    mlx_repo = _get_mlx_repo(model_name)
-    model = None  # MLX loads on first transcribe() call
+    if _is_parakeet(model_name):
+        from mlx_audio.stt import load as load_stt
+        _parakeet_model = load_stt(config.get("mlx_models", {}).get(model_name, "mlx-community/parakeet-tdt-0.6b-v3"))
+    else:
+        import mlx_whisper
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
@@ -1289,7 +1291,7 @@ def cmd_live(args):
             chunk_in_progress = True
             process_start = time.time()
             try:
-                result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
+                result = _transcribe_chunk(chunk, model_name, language)
                 process_seconds = time.time() - process_start
 
                 segments = result.get("segments", [])
@@ -1460,7 +1462,7 @@ def cmd_live(args):
         remaining_duration = total_samples / SAMPLE_RATE
         print(f"  ⏳ Transcribing full recording ({format_duration(remaining_duration)})...")
         try:
-            result = _transcribe_mlx(str(output_path), model_name, language)
+            result = _transcribe_audio(str(output_path), model_name, language)
             segments = result.get("segments", [])
             with transcribe_lock:
                 transcribed_segments.extend(segments)
@@ -1478,7 +1480,7 @@ def cmd_live(args):
         overlap_boundary = last_transcribed_sample / SAMPLE_RATE
 
         try:
-            result = _transcribe_mlx_chunk(chunk, mlx_repo, language)
+            result = _transcribe_chunk(chunk, model_name, language)
             segments = result.get("segments", [])
             for seg in segments:
                 seg["start"] = seg.get("start", 0) + offset
@@ -1492,9 +1494,9 @@ def cmd_live(args):
         except Exception as e:
             print(f"  ⚠  Final chunk failed: {e}")
 
-    # Free whisper model
-    if model is not None:
-        del model
+    # Free model memory
+    if _is_parakeet(model_name) and '_parakeet_model' in dir():
+        del _parakeet_model
     gc.collect()
 
     all_segments = sorted(transcribed_segments, key=lambda s: s.get("start", 0))
@@ -1817,13 +1819,11 @@ def _denoise_audio(audio_path):
     denoising is disabled or fails.
     """
     denoise_cfg = config.get("denoise", {})
-    if not denoise_cfg.get("enabled", True):
-        return audio_path, 0
 
     import soundfile as sf
 
     factor = denoise_cfg.get("factor", 2.0)
-    profile_secs = denoise_cfg.get("noise_profile_seconds", 10)
+    profile_secs = denoise_cfg.get("noise_profile_seconds", 3)
     sr = SAMPLE_RATE
 
     try:
@@ -1965,12 +1965,12 @@ def _transcribe_parakeet(audio_path, model_name="parakeet"):
     return {"segments": segments, "language": "en", "text": result.text}
 
 
-def _transcribe_mlx_chunk(chunk, mlx_repo, language="en"):
-    """Transcribe a numpy audio chunk via mlx-whisper (writes to temp file).
+def _transcribe_chunk(chunk, model_name, language="en"):
+    """Transcribe a numpy audio chunk. Writes to temp file, transcribes, cleans up.
 
+    Works with both Parakeet and Whisper models.
     Returns the transcription result dict.
     """
-    import mlx_whisper
     import soundfile as sf
 
     tmp_path = None
@@ -1978,13 +1978,9 @@ def _transcribe_mlx_chunk(chunk, mlx_repo, language="en"):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             sf.write(tmp.name, chunk, SAMPLE_RATE)
             tmp_path = tmp.name
-        return mlx_whisper.transcribe(
-            tmp_path, path_or_hf_repo=mlx_repo,
-            word_timestamps=True, language=language,
-        )
+        return _transcribe_audio(tmp_path, model_name, language, word_timestamps=True)
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        _cleanup_temp_files(tmp_path)
 
 
 def _diarize_mlx_audio(audio_path):
@@ -2714,7 +2710,7 @@ def cmd_watch(args):
     watch_cfg = config.get("watch", {})
     silence_timeout = watch_cfg.get("silence_timeout_minutes", 10)
     min_recording = watch_cfg.get("min_recording_minutes", 2)
-    model_name = watch_cfg.get("model", config.get("default_model", "small"))
+    model_name = watch_cfg.get("model", config.get("default_model", "parakeet"))
     end_buffer = watch_cfg.get("end_buffer_minutes", 2)
     calendars = watch_cfg.get("calendars", []) or []
     refresh_hours = watch_cfg.get("refresh_hours", 3)
