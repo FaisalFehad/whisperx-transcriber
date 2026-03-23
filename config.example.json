@@ -29,7 +29,7 @@
         "_comment": "Off by default. Enable with --denoise flag for noisy recordings that start with silence.",
         "enabled": false,
         "factor": 2.0,
-        "noise_profile_seconds": 10,
+        "noise_profile_seconds": 3,
         "n_fft": 2048,
         "hop_length": 512
     },
