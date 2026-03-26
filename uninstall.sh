@@ -6,7 +6,7 @@
 #   - Speaker voice profiles
 #   - Log files
 #   - Virtual environment (.venv)
-#   - Cached models (~/.cache/huggingface, torch)
+#   - Cached models (~/.cache/huggingface)
 #   - Shell alias from .zshrc
 #   - Config file
 #   - Optionally: recordings and transcripts from Obsidian
@@ -109,17 +109,14 @@ fi
 echo ""
 read -p "  Remove cached AI models from ~/.cache? [y/N] " remove_cache
 if [ "$remove_cache" = "y" ] || [ "$remove_cache" = "Y" ]; then
-    # Transcription, diarization, and embedding models
+    # Transcription and diarisation models
     if [ -d "$HOME/.cache/huggingface/hub" ]; then
         find "$HOME/.cache/huggingface/hub" -maxdepth 1 -type d \( \
             -name "*whisper*" -o \
             -name "*parakeet*" -o \
-            -name "*sortformer*" -o \
-            -name "*pyannote*" -o \
-            -name "*wav2vec2*" -o \
-            -name "*embedding*" \
+            -name "*sortformer*" \
         \) -exec rm -rf {} + 2>/dev/null
-        echo "  ✅ Removed cached transcription/diarization models"
+        echo "  ✅ Removed cached transcription/diarisation models"
     fi
 
     # CTranslate2 whisper models

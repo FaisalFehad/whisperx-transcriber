@@ -54,6 +54,17 @@ def poll_key():
 # Waveform block characters — 8 levels from silence to peak
 _WAVE_CHARS = " ▁▂▃▄▅▆▇"
 
+# Shared RMS thresholds for audio quality indicators
+_RMS_GOOD = 0.01   # green — strong signal
+_RMS_LOW = 0.003   # yellow — weak but audible
+
+
+def rms_colour(rms):
+    """Return 'green', 'yellow', or 'red' for an RMS level."""
+    if rms > _RMS_GOOD:
+        return "green"
+    return "yellow" if rms > _RMS_LOW else "red"
+
 
 def info_panel(title, rows, *, subtitle=None):
     """Display an info box with label: value rows.
@@ -132,12 +143,9 @@ def _waveform(rms_history, width=24):
 
 def _quality_indicator(rms):
     """Return colored quality label for current RMS."""
-    if rms > 0.01:
-        return "[green]● Good[/green]"
-    elif rms > 0.003:
-        return "[yellow]● Low[/yellow]"
-    else:
-        return "[red]● Silent[/red]"
+    c = rms_colour(rms)
+    label = "Good" if c == "green" else ("Low" if c == "yellow" else "Silent")
+    return f"[{c}]● {label}[/{c}]"
 
 
 def format_duration(seconds):
@@ -152,6 +160,13 @@ def format_duration(seconds):
     return f"{m:02d}:{s:02d}"
 
 
+def _channel_bar(rms, width=16):
+    """Render a single channel as a coloured bar. Returns markup string."""
+    filled = int(min(1.0, rms * 15) * width)
+    c = rms_colour(rms)
+    return f"[{c}]{'█' * filled}{'░' * (width - filled)}[/{c}]"
+
+
 class RecordingDisplay:
     """Live-updating recording meter using Rich.
 
@@ -164,6 +179,8 @@ class RecordingDisplay:
     """
 
     def __init__(self, wave_width=24):
+        self._mic_history = deque(maxlen=wave_width)
+        self._sys_history = deque(maxlen=wave_width)
         self._rms_history = deque(maxlen=wave_width)
         self._live = Live("", console=console, auto_refresh=False)
         self._warnings = []
@@ -181,34 +198,38 @@ class RecordingDisplay:
 
     def update(self, rms, elapsed, silence_elapsed, paused=False,
                mic_rms=None, sys_rms=None):
-        """Refresh the display with current audio state.
-
-        Args:
-            rms: combined RMS (max of mic and system)
-            elapsed: seconds since recording started
-            silence_elapsed: seconds of continuous silence
-            paused: whether recording is paused
-            mic_rms: mic channel RMS (optional, for per-channel display)
-            sys_rms: system channel RMS (optional, for per-channel display)
-        """
+        """Refresh the display with current audio state."""
         if not paused:
             self._rms_history.append(rms)
+            if mic_rms is not None:
+                self._mic_history.append(mic_rms)
+            if sys_rms is not None:
+                self._sys_history.append(sys_rms)
 
         time_str = format_duration(elapsed)
 
         if paused:
             parts = [f"  [yellow]⏸ {time_str}  PAUSED[/yellow]  [dim](P to resume)[/dim]"]
+        elif mic_rms is not None and sys_rms is not None:
+            # Dual-channel display with waveform history + live bars
+            mic_wave = _waveform(self._mic_history)
+            sys_wave = _waveform(self._sys_history)
+            mic_bar = _channel_bar(mic_rms)
+            sys_bar = _channel_bar(sys_rms)
+            parts = [
+                f"  ⏺ {time_str}",
+                f"  [dim]Mic[/dim]  {mic_wave}  {mic_bar}",
+                f"  [dim]Sys[/dim]  {sys_wave}  {sys_bar}",
+            ]
+            if silence_elapsed > 0:
+                parts[0] += f"  [dim]silence {int(silence_elapsed)}s[/dim]"
         else:
+            # Mono display
             wave = _waveform(self._rms_history)
             quality = _quality_indicator(rms)
             parts = [f"  ⏺ {time_str}  {wave}  {quality}"]
             if silence_elapsed > 0:
                 parts[0] += f"  [dim]silence {int(silence_elapsed)}s[/dim]"
-            # Per-channel levels when both available
-            if mic_rms is not None and sys_rms is not None:
-                mic_q = "[green]●[/green]" if mic_rms > 0.003 else "[red]●[/red]"
-                sys_q = "[green]●[/green]" if sys_rms > 0.003 else "[red]●[/red]"
-                parts.append(f"  [dim]Mic {mic_q} {mic_rms:.3f}  System {sys_q} {sys_rms:.3f}[/dim]")
 
         for w in self._warnings:
             parts.append(f"  [yellow]⚠ {w}[/yellow]")

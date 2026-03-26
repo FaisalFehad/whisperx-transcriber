@@ -84,11 +84,9 @@ if grep -q "HF_TOKEN" "$SHELL_RC" 2>/dev/null; then
     echo "  ✅ HF_TOKEN found in $SHELL_RC"
 else
     echo ""
-    echo "  ⚠  HF_TOKEN not set (needed for speaker diarization)"
+    echo "  ⚠  HF_TOKEN not set (needed for speaker diarisation)"
     echo "     1. Get a free token at: https://huggingface.co/settings/tokens"
-    echo "     2. Accept terms at: https://hf.co/pyannote/speaker-diarization-3.1"
-    echo "     3. Accept terms at: https://hf.co/pyannote/segmentation-3.0"
-    echo "     4. Add to your shell: echo 'export HF_TOKEN=your_token' >> $SHELL_RC"
+    echo "     2. Add to your shell: echo 'export HF_TOKEN=your_token' >> $SHELL_RC"
 fi
 
 # ─── System Audio (ScreenCaptureKit) ─────────────────────────────────────────

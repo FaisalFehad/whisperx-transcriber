@@ -9,7 +9,7 @@ Fast, private speech-to-text for macOS. Record meetings, lectures, podcasts, or 
 - **Parakeet CTC engine** — default model that cannot hallucinate (no "Thank Thank Thank..." on silence)
 - **Proper punctuation and capitalization** — out of the box, no post-processing needed
 - **Whisper fallback** — 4 Whisper models available for multilingual or low-RAM setups
-- **Audio normalization** — peak-headroom-aware volume normalization before transcription (configurable)
+- **Audio normalisation** — peak-headroom-aware volume normalisation before transcription (configurable)
 - **Hallucination protection** — silence threshold detection skips fake text in Whisper output
 - **99 languages** — via Whisper models (Parakeet supports English + 25 European languages)
 - **Multiple formats** — MP3, WAV, M4A, OGG, FLAC, WebM
@@ -27,7 +27,7 @@ Fast, private speech-to-text for macOS. Record meetings, lectures, podcasts, or 
 
 ### Speaker Identification
 
-- **Speaker diarization** — identifies who said what using Sortformer on Apple GPU
+- **Speaker diarisation** — identifies who said what using Sortformer on Apple GPU
 - **Up to 4 speakers** per channel — automatically separated and labeled
 - **Configurable sensitivity** — tune detection threshold, minimum duration, and merge gap
 
@@ -47,7 +47,7 @@ Fast, private speech-to-text for macOS. Record meetings, lectures, podcasts, or 
 ### Privacy
 
 - **Fully local** — all processing on Apple Silicon GPU, no cloud APIs
-- **No accounts** — no sign-ups, no API keys (except free HF token for diarization)
+- **No accounts** — no sign-ups, no API keys (except free HF token for diarisation)
 - **No telemetry** — nothing phones home
 - **Your data stays yours** — audio and transcripts never leave your machine
 
@@ -69,7 +69,7 @@ source ~/.zshrc
 
 The installer creates a virtual environment, installs dependencies, and adds the `transcribe` command to your shell.
 
-### Hugging Face Token (for speaker diarization)
+### Hugging Face Token (for speaker diarisation)
 
 Speaker identification requires a free Hugging Face token:
 
@@ -131,14 +131,14 @@ The transcript is saved as Markdown to your configured output folder.
 | `-m`           | `-m medium`         | Use a different model (default: parakeet)                                                                               |
 | `-t`           | `-t "Team Meeting"` | Set the transcript title                                                                                                |
 | `-l`           | `-l ar`             | Set language (default: en) — [99 languages supported](https://github.com/openai/whisper#available-models-and-languages) |
-| `--no-diarize` |                     | Skip speaker identification (faster)                                                                                    |
+| `--no-diarise` |                     | Skip speaker identification (faster)                                                                                    |
 | `--denoise`    |                     | Enable spectral subtraction denoising (off by default)                                                                  |
 
 **Examples:**
 
 ```bash
 # Transcribe a podcast
-transcribe run ~/Downloads/episode.mp3 -t "Episode 42" --no-diarize
+transcribe run ~/Downloads/episode.mp3 -t "Episode 42" --no-diarise
 
 # Meeting with title
 transcribe run ~/Downloads/meeting.m4a -t "Q1 Review"
@@ -158,7 +158,7 @@ Record and transcribe at the same time. Audio is transcribed in background chunk
 transcribe live                              # Uses config defaults
 transcribe live -m medium                    # Use a specific model
 transcribe live -t "Team Standup"            # Set title
-transcribe live --no-diarize                 # Skip speaker identification
+transcribe live --no-diarise                 # Skip speaker identification
 ```
 
 **Adaptive scaling:** If your machine is struggling, live mode automatically increases the interval between chunks or falls back to record-only mode (transcribes after the call ends).
@@ -243,7 +243,7 @@ audio_duration: 1847.3
 **[01:23] Bob:** Revenue was up 12% compared to last quarter...
 ```
 
-Without diarization, segments show timestamps only:
+Without diarisation, segments show timestamps only:
 
 ```markdown
 **[00:00]** Welcome to episode 42...
@@ -268,15 +268,11 @@ Any value you omit uses the built-in default.
 | `language`                 | `"en"`       | Language code ([99 languages supported](https://github.com/openai/whisper#available-models-and-languages)) |
 | `auto_title_from_calendar` | `true`       | Use calendar event name as transcript title                                                                |
 
-### Audio Normalization
+### Audio Normalisation
 
-Volume normalization before transcription. Scales audio to consistent level with peak headroom to prevent clipping. Stereo channels are normalized independently.
-
-| Key                          | Default | What it does                                 |
-| ---------------------------- | ------- | -------------------------------------------- |
-| `normalize.enabled`          | `true`  | Normalize audio volume before transcription  |
-| `normalize.target_rms`       | `0.05`  | Target RMS level (~-26 dBFS)                 |
-| `normalize.peak_headroom_db` | `1.0`   | Keep peaks below -1 dBFS to prevent clipping |
+| Key         | Default | What it does                                                              |
+| ----------- | ------- | ------------------------------------------------------------------------- |
+| `normalise` | `true`  | Volume normalisation before transcription (0.05 RMS with peak headroom) |
 
 ### Audio Denoising
 
@@ -305,7 +301,7 @@ Spectral subtraction pre-processing. **Off by default** — eval tests showed al
 | `recording.mic_low_warning_seconds` | `10`                            | Warn if mic stays very low for this long                        |
 | `recording.virtual_device_names`    | `["Aggregate", "Multi-Output"]` | Virtual audio devices to exclude from mic selection             |
 
-### Speaker Diarization
+### Speaker Diarisation
 
 | Key                        | Default | What it does                                               |
 | -------------------------- | ------- | ---------------------------------------------------------- |
@@ -340,7 +336,7 @@ Spectral subtraction pre-processing. **Off by default** — eval tests showed al
 
 **System audio not captured** — Grant Screen Recording permission: System Settings → Privacy & Security → Screen Recording → enable your terminal app.
 
-**Speaker diarization not working** — Make sure `HF_TOKEN` is set and you've accepted the model terms on Hugging Face (see install instructions above).
+**Speaker diarisation not working** — Make sure `HF_TOKEN` is set and you've accepted the model terms on Hugging Face (see install instructions above).
 
 **Live mode too slow** — The adaptive system handles this automatically. You can also use a smaller model (`-m small.en`) or increase `live.chunk_interval_seconds`.
 
@@ -363,7 +359,7 @@ Removes: virtual environment, shell alias, watch daemon, log files, and config. 
 ## Acknowledgements
 
 - [Parakeet TDT](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/models.html#parakeet-tdt) — CTC speech recognition from NVIDIA NeMo
-- [Sortformer](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/configs.html) — neural speaker diarization from NVIDIA NeMo
+- [Sortformer](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/speaker_diarization/configs.html) — neural speaker diarisation from NVIDIA NeMo
 - [mlx-audio](https://github.com/Blaizzy/mlx-audio) — MLX bindings for Parakeet, Sortformer, and Whisper on Apple Silicon
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) — Whisper on Apple Silicon GPU via MLX
 - [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) — macOS system audio capture

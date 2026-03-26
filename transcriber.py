@@ -50,10 +50,6 @@ DEFAULT_CONFIG = {
     # Language code for transcription (e.g. "en", "ar", "fr")
     "language": "en",
 
-    # ── Batch sizes (legacy — not used by current MLX models) ────────────
-    # MLX models manage batching internally. Kept for config compatibility.
-    "batch_sizes": {},
-
     # ── File paths ───────────────────────────────────────────────────────
     "paths": {
         # Root folder for recordings and transcripts
@@ -83,10 +79,10 @@ DEFAULT_CONFIG = {
     "audio": {
         # Keep the source WAV after successful transcription (True) or delete it (False)
         "keep_recording": True,
-        # Diarize mic channel (for conference room with multiple local speakers)
+        # Diarise mic channel (for conference room with multiple local speakers)
         # False (default): mic = "You" — fastest, correct when alone at desk
         # True: run Sortformer on mic channel too to separate local speakers
-        "diarize_mic": False,
+        "diarise_mic": False,
     },
 
     # Accepted audio file types for transcription and listing
@@ -97,6 +93,11 @@ DEFAULT_CONFIG = {
     # Falls back to date-only if no event is happening or calendar unavailable
     "auto_title_from_calendar": True,
 
+    # ── History logging ────────────────────────────────────────────────
+    # Log each transcription run to history.jsonl for benchmarking.
+    # Disabled by default — enable in config.json to track performance.
+    "history": False,
+
     # ── Whisper-specific settings ────────────────────────────────────────
     # Only used when default_model is a Whisper model (not parakeet)
     "whisper": {
@@ -105,9 +106,9 @@ DEFAULT_CONFIG = {
         "hallucination_silence_threshold": 2.0,
     },
 
-    # ── Speaker diarization (who said what) ──────────────────────────────
+    # ── Speaker diarisation (who said what) ──────────────────────────────
     "diarization": {
-        # Set to false to always skip diarization (faster, no speaker labels)
+        # Set to false to always skip diarisation (faster, no speaker labels)
         "enabled": True,
         # Sortformer model (max 4 speakers per channel)
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
@@ -165,18 +166,10 @@ DEFAULT_CONFIG = {
         "record_only": True,
     },
 
-    # ── Audio normalization ──────────────────────────────────────────────
-    "normalize": {
-        # Normalize audio volume before transcription.
-        # Scales to target RMS with peak headroom to prevent clipping.
-        # Each stereo channel is normalized independently.
-        "enabled": True,
-        # Target RMS level (linear). 0.05 ≈ -26 dBFS — good for all models.
-        "target_rms": 0.05,
-        # Peak headroom in dB. Prevents peaks from exceeding -N dBFS.
-        # 1.0 dB keeps peaks at -1 dBFS (0.891 linear) — no clipping.
-        "peak_headroom_db": 1.0,
-    },
+    # ── Audio normalisation ──────────────────────────────────────────────
+    # Scales to 0.05 RMS with peak headroom to prevent clipping.
+    # Stereo channels normalised independently. Set to False to disable.
+    "normalise": True,
 
     # ── Audio denoising ─────────────────────────────────────────────────
     "denoise": {
@@ -539,63 +532,23 @@ def _remove_checkpoint(cp_path):
 
 # ─── Run History ─────────────────────────────────────────────────────────────
 
+
+
+# ─── History Logging ─────────────────────────────────────────────────────────
+
 HISTORY_LOG = SCRIPT_DIR / "history.jsonl"
 
 
-def _get_system_info():
-    """Collect system info for debugging: RAM, chip, GPU memory pressure."""
-    info = {}
-    try:
-        import platform
-        info["os"] = platform.mac_ver()[0]
-        info["chip"] = platform.processor() or subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-    except Exception:
-        pass
-    try:
-        # Total RAM in GB
-        mem = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=5
-        )
-        if mem.returncode == 0:
-            info["ram_gb"] = round(int(mem.stdout.strip()) / (1024**3), 1)
-    except Exception:
-        pass
-    try:
-        # Available RAM at time of run
-        import psutil
-        vm = psutil.virtual_memory()
-        info["ram_available_gb"] = round(vm.available / (1024**3), 1)
-        info["ram_percent_used"] = vm.percent
-    except ImportError:
-        pass
-    try:
-        # GPU memory pressure (macOS)
-        gpu = subprocess.run(
-            ["sysctl", "-n", "iogpu.wired_limit_mb"],
-            capture_output=True, text=True, timeout=5
-        )
-        if gpu.returncode == 0 and gpu.stdout.strip():
-            info["gpu_wired_limit_mb"] = int(gpu.stdout.strip())
-    except Exception:
-        pass
-    return info
-
-
 def _log_run(metadata, step_times=None):
-    """Append a transcription run to history.jsonl for benchmarking."""
+    """Append a transcription run to history.jsonl (if history is enabled in config)."""
+    if not config.get("history", False):
+        return
     entry = {
         "timestamp": datetime.now().isoformat(),
         **metadata,
     }
     if step_times:
-        entry["steps"] = {
-            name: round(t, 1) for name, t in step_times.items()
-        }
-    entry["system"] = _get_system_info()
+        entry["steps"] = {name: round(t, 1) for name, t in step_times.items()}
     try:
         with open(HISTORY_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -604,9 +557,11 @@ def _log_run(metadata, step_times=None):
 
 
 def cmd_history(args):
-    """Show transcription run history with model performance stats."""
+    """Show transcription run history with performance stats."""
     if not HISTORY_LOG.exists():
-        print("  No history yet. Run a transcription first.")
+        print("  No history yet.")
+        if not config.get("history", False):
+            print("  History is disabled. Enable with: \"history\": true in config.json")
         return
 
     runs = []
@@ -623,24 +578,24 @@ def cmd_history(args):
         print("  No history yet.")
         return
 
-    # Summary table
     print()
-    print(f"  {'Date':<12} {'Model':<14} {'Audio':>7} {'Time':>7} {'Speed':>7} {'Seg':>5} {'Spk':>5}  File")
-    print(f"  {'─'*12} {'─'*14} {'─'*7} {'─'*7} {'─'*7} {'─'*5} {'─'*5}  {'─'*20}")
+    print(f"  {'Date':<12} {'Model':<10} {'Mode':<6} {'Audio':>7} {'Time':>7} {'Speed':>7} {'Seg':>5} {'Spk':>4}  Title")
+    print(f"  {'─'*12} {'─'*10} {'─'*6} {'─'*7} {'─'*7} {'─'*7} {'─'*5} {'─'*4}  {'─'*25}")
 
     for run in runs:
         date = run.get("timestamp", "")[:10]
-        model = run.get("model", "?")[:13]
+        model = run.get("model", "?")[:9]
+        mode = run.get("mode", "run")[:5]
         audio_dur = run.get("audio_duration", 0)
         proc_time = run.get("processing_time", 0)
         speed = f"{audio_dur / proc_time:.1f}x" if proc_time > 0 else "?"
         segments = run.get("segments", "?")
         speakers = run.get("speakers", "?")
-        audio_file = run.get("audio_file", "?")
-        if len(audio_file) > 30:
-            audio_file = audio_file[:27] + "..."
+        title = run.get("title", run.get("audio_file", "?"))
+        if len(title) > 25:
+            title = title[:22] + "..."
 
-        print(f"  {date:<12} {model:<14} {format_duration(audio_dur):>7} {format_duration(proc_time):>7} {speed:>7} {segments:>5} {speakers:>5}  {audio_file}")
+        print(f"  {date:<12} {model:<10} {mode:<6} {format_duration(audio_dur):>7} {format_duration(proc_time):>7} {speed:>7} {segments:>5} {speakers:>4}  {title}")
 
     # Per-model averages
     from collections import defaultdict
@@ -654,11 +609,11 @@ def cmd_history(args):
 
     if model_stats:
         print()
-        print(f"  {'Model':<14} {'Runs':>5} {'Avg Speed':>10} {'Min':>7} {'Max':>7}")
-        print(f"  {'─'*14} {'─'*5} {'─'*10} {'─'*7} {'─'*7}")
+        print(f"  {'Model':<10} {'Runs':>5} {'Avg Speed':>10} {'Min':>7} {'Max':>7}")
+        print(f"  {'─'*10} {'─'*5} {'─'*10} {'─'*7} {'─'*7}")
         for model, speeds in sorted(model_stats.items()):
             avg = sum(speeds) / len(speeds)
-            print(f"  {model:<14} {len(speeds):>5} {avg:>9.1f}x {min(speeds):>6.1f}x {max(speeds):>6.1f}x")
+            print(f"  {model:<10} {len(speeds):>5} {avg:>9.1f}x {min(speeds):>6.1f}x {max(speeds):>6.1f}x")
 
     print()
 
@@ -687,11 +642,8 @@ def spinner_char(tick):
 
 def _rms_emoji(rms):
     """Return a colored emoji for an RMS level."""
-    if rms > 0.01:
-        return "🟢"
-    if rms > 0.003:
-        return "🟡"
-    return "🔴"
+    from ui import rms_colour
+    return {"green": "🟢", "yellow": "🟡", "red": "🔴"}[rms_colour(rms)]
 
 
 def get_available_ram_gb():
@@ -734,6 +686,101 @@ def check_ram_for_model(model_name):
 
 
 # ─── Audio Device Detection ───────────────────────────────────────────────────
+
+class MicMonitor:
+    """Detect mic device changes via CoreAudio and hot-switch the PortAudio stream.
+
+    CoreAudio provides real-time device change detection (no cache).
+    When a change is detected, PortAudio is reinitialised to pick up the new device.
+    The old stream is stopped before the new one starts (~100ms gap).
+    """
+
+    def __init__(self):
+        self._last_check = 0.0
+        self._last_ca_id = -1
+        self._ca_lib = None
+        self._ca_setup = False
+        self.switch_count = 0
+
+    def _ensure_coreaudio(self):
+        """Load CoreAudio framework once."""
+        if self._ca_setup:
+            return self._ca_lib
+        self._ca_setup = True
+        try:
+            from ctypes import cdll
+            self._ca_lib = cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+            )
+        except Exception:
+            self._ca_lib = None
+        return self._ca_lib
+
+    def _get_ca_device_id(self):
+        """Query CoreAudio for the current default input device ID."""
+        ca = self._ensure_coreaudio()
+        if ca is None:
+            return -1
+        try:
+            if not hasattr(self, '_ca_addr'):
+                from ctypes import c_uint32, byref, Structure
+                class _Addr(Structure):
+                    _fields_ = [("s", c_uint32), ("sc", c_uint32), ("e", c_uint32)]
+                self._ca_types = (c_uint32, byref)
+                self._ca_addr = _Addr(0x64496E20, 0x676C6F62, 0)  # 'dIn ', 'glob', main
+            c_uint32, byref = self._ca_types
+            dev = c_uint32(0)
+            size = c_uint32(4)
+            if ca.AudioObjectGetPropertyData(1, byref(self._ca_addr), 0, None, byref(size), byref(dev)) == 0:
+                return dev.value
+        except Exception:
+            pass
+        return -1
+
+    def check_and_switch(self, mic_stream, current_mic_id, create_stream_fn, paused=False):
+        """Check for device change every 2s. Returns (stream, mic_id, mic_name, switched).
+
+        Call this from the recording loop. If no change detected, returns the
+        same stream and mic_id with switched=False.
+        """
+        import sounddevice as sd
+
+        now = time.time()
+        if paused or now - self._last_check < 2.0:
+            return mic_stream, current_mic_id, None, False
+        self._last_check = now
+
+        ca_id = self._get_ca_device_id()
+        if ca_id <= 0 or ca_id == self._last_ca_id:
+            if self._last_ca_id == -1:
+                self._last_ca_id = ca_id
+            return mic_stream, current_mic_id, None, False
+
+        self._last_ca_id = ca_id
+
+        # Device changed — reinit PortAudio and switch
+        try:
+            mic_stream.stop()
+            mic_stream.close()
+            sd._terminate()
+            sd._initialize()
+            new_id, new_name = get_default_mic()
+            if new_id is not None:
+                mic_stream = create_stream_fn(new_id)
+                mic_stream.start()
+                self.switch_count += 1
+                return mic_stream, new_id, new_name, True
+        except Exception:
+            # Recovery: restart on any available device
+            try:
+                sd._terminate()
+                sd._initialize()
+                mic_stream = create_stream_fn(current_mic_id)
+                mic_stream.start()
+            except Exception:
+                pass
+        return mic_stream, current_mic_id, None, False
+
 
 def _cleanup_temp_files(*paths):
     """Safe cleanup of multiple temporary files."""
@@ -899,6 +946,8 @@ def cmd_record(args):
     current_sys_rms = 0.0
     start_time = time.time()
     lock = threading.Lock()
+    mic_switch_frames = []
+    mic_monitor = MicMonitor()
 
     def mic_callback(indata, frame_count, time_info, status):
         nonlocal silence_start, current_mic_rms, recording
@@ -933,11 +982,15 @@ def cmd_record(args):
                 silence_start = None
 
     blocksize = int(SAMPLE_RATE * 0.5)
+    current_mic_id = mic_id
 
-    mic_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-        device=mic_id, blocksize=blocksize, callback=mic_callback,
-    )
+    def _create_mic_stream(dev_id):
+        return sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            device=dev_id, blocksize=blocksize, callback=mic_callback,
+        )
+
+    mic_stream = _create_mic_stream(mic_id)
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
@@ -992,6 +1045,15 @@ def cmd_record(args):
                     if health:
                         warning = health if not warning else f"{warning} │ {health}"
 
+                # Check for mic device change (e.g. AirPods connected/disconnected)
+                mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
+                    mic_stream, current_mic_id, _create_mic_stream, paused=paused)
+                if switched:
+                    mic_name = new_name
+                    with lock:
+                        mic_switch_frames.append(len(mic_frames))
+                    warning = f"Switched to {new_name}"
+
                 display.set_warning(warning)
 
                 display.update(rms, elapsed, silence_elapsed, paused=paused,
@@ -1014,7 +1076,8 @@ def cmd_record(args):
         print("  ⚠  No audio recorded.")
         return
 
-    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode)
+    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode,
+                            mic_switch_points=mic_switch_frames if mic_switch_frames else None)
     saved_to = _safe_write_audio(output_path, audio_data, SAMPLE_RATE, description="recording")
     if saved_to:
         output_path = saved_to
@@ -1034,27 +1097,40 @@ def cmd_record(args):
     prompt_transcribe(str(output_path))
 
 
-def _mix_audio(mic_frames, sys_frames, dual_mode, normalize=True):
+def _mix_audio(mic_frames, sys_frames, dual_mode, normalise=True, mic_switch_points=None):
     """Combine mic + system audio. Returns stereo (N,2) when dual, mono (N,) when single.
 
     Stereo format: channel 0 = mic, channel 1 = system audio.
-    Each channel is independently normalized before combining (unless normalize=False).
+    Each channel is independently normalised before combining (unless normalise=False).
+    If mic_switch_points is provided, normalises each mic segment independently
+    to handle volume differences between devices (e.g. AirPods vs MacBook mic).
     """
     if not mic_frames:
         return np.array([], dtype=np.float32)
-    mic_audio = np.concatenate(mic_frames).flatten()
-    if normalize:
-        mic_audio = _normalize(mic_audio)
+
+    if normalise and mic_switch_points:
+        # Normalise each device segment independently (handles volume differences)
+        boundaries = [0] + mic_switch_points + [len(mic_frames)]
+        parts = []
+        for i in range(len(boundaries) - 1):
+            seg = mic_frames[boundaries[i]:boundaries[i + 1]]
+            if seg:
+                parts.append(_normalise(np.concatenate(seg)))
+        mic_audio = np.concatenate(parts) if parts else np.array([], dtype=np.float32)
+    else:
+        mic_audio = np.concatenate(mic_frames)
+        if normalise:
+            mic_audio = _normalise(mic_audio)
     if dual_mode and sys_frames:
-        sys_audio = np.concatenate(sys_frames).flatten()
-        if normalize:
-            sys_audio = _normalize(sys_audio)
+        sys_audio = np.concatenate(sys_frames)
+        if normalise:
+            sys_audio = _normalise(sys_audio)
         min_len = min(len(mic_audio), len(sys_audio))
-        _log("mix", mode="stereo", normalize=normalize, samples=min_len,
+        _log("mix", mode="stereo", normalise=normalise, samples=min_len,
              mic_rms=f"{np.sqrt(np.mean(mic_audio[:min_len]**2)):.5f}",
              sys_rms=f"{np.sqrt(np.mean(sys_audio[:min_len]**2)):.5f}")
         return np.column_stack([mic_audio[:min_len], sys_audio[:min_len]])
-    _log("mix", mode="mono", normalize=normalize, samples=len(mic_audio),
+    _log("mix", mode="mono", normalise=normalise, samples=len(mic_audio),
          rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}")
     return mic_audio
 
@@ -1076,7 +1152,7 @@ def prompt_transcribe(audio_path):
             model=model,
             title=title or None,
             language=config["language"],
-            no_diarize=False,
+            no_diarise=False,
             denoise=False,
             no_denoise=False,
             debug=False,
@@ -1142,7 +1218,7 @@ def cmd_live(args):
 
     language = args.language or config["language"]
     chunk_interval = config["live"]["chunk_interval_seconds"]
-    no_diarize = args.no_diarize
+    no_diarise = args.no_diarise
     title = args.title
 
     # ── Pre-load model ──────────────────────────────────────────────────
@@ -1249,9 +1325,9 @@ def cmd_live(args):
                 return None
             mic_copy = list(mic_frames)
             sys_copy = list(sys_frames) if dual_mode else []
-        mic_audio = _normalize(np.concatenate(mic_copy).flatten())
+        mic_audio = _normalise(np.concatenate(mic_copy).flatten())
         if sys_copy:
-            sys_audio = _normalize(np.concatenate(sys_copy).flatten())
+            sys_audio = _normalise(np.concatenate(sys_copy).flatten())
             min_len = min(len(mic_audio), len(sys_audio))
             return (mic_audio[:min_len] + sys_audio[:min_len]) / 2.0
         return mic_audio
@@ -1347,10 +1423,16 @@ def cmd_live(args):
 
     # ── Start recording + background transcription ────────────────────────
     blocksize = int(SAMPLE_RATE * 0.5)
-    mic_stream = sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-        device=mic_id, blocksize=blocksize, callback=mic_callback,
-    )
+    current_mic_id = mic_id
+    mic_monitor = MicMonitor()
+
+    def _create_mic_stream(dev_id):
+        return sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            device=dev_id, blocksize=blocksize, callback=mic_callback,
+        )
+
+    mic_stream = _create_mic_stream(mic_id)
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
@@ -1401,6 +1483,13 @@ def cmd_live(args):
                 chunk_status = f" │ Chunks: {chunks_done}"
                 if chunk_in_progress:
                     chunk_status += " ⟳"
+
+            # Check for mic device change
+            mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
+                mic_stream, current_mic_id, _create_mic_stream)
+            if switched:
+                mic_name = new_name
+                mic_warn = f" Switched to {new_name}"
 
             meter = level_meter(rms)
             status_line = (
@@ -1515,25 +1604,25 @@ def cmd_live(args):
 
     result = {"segments": all_segments, "language": language}
 
-    # ── Diarization ─────────────────────────────────────────────────────
-    diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
-    if config["diarization"]["enabled"] and not no_diarize and not HF_TOKEN:
+    # ── Diarisation ─────────────────────────────────────────────────────
+    diarise_enabled = config["diarization"]["enabled"] and not no_diarise and HF_TOKEN
+    if config["diarization"]["enabled"] and not no_diarise and not HF_TOKEN:
         print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
-    if diarize_enabled:
+    if diarise_enabled:
         print("  ⏳ Identifying speakers...")
         try:
-            # For stereo files, diarize system channel only
+            # For stereo files, diarise system channel only
             if _is_stereo(str(output_path)):
                 mic_tmp, sys_tmp = _split_stereo(str(output_path))
                 try:
-                    speaker_turns = _diarize_standalone(sys_tmp)
+                    speaker_turns = _diarise_standalone(sys_tmp)
                 finally:
                     _cleanup_temp_files(mic_tmp, sys_tmp)
             else:
-                speaker_turns = _diarize_standalone(str(output_path))
+                speaker_turns = _diarise_standalone(str(output_path))
             result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
         except Exception as e:
-            print(f"  ⚠  Diarization failed: {e}")
+            print(f"  ⚠  Diarisation failed: {e}")
 
     # ── Save transcript ───────────────────────────────────────────────────
     # Checkpoint: save raw result immediately so downstream failures don't lose it
@@ -1564,17 +1653,13 @@ def cmd_live(args):
         # Open transcript folder in Finder
         subprocess.run(["open", str(transcript_file.parent)], check=False)
 
-        # Log run to history for benchmarking
         _log_run({
-            "model": model_name,
-            "engine": "mlx",
-            "language": language,
+            "model": model_name, "mode": "live", "title": title,
             "audio_duration": round(elapsed, 1),
             "processing_time": round(post_time, 1),
             "segments": len(result.get("segments") or []),
             "speakers": len(speaker_names),
             "audio_file": output_path.name,
-            "mode": "live",
         })
 
     except Exception as e:
@@ -1728,8 +1813,8 @@ def _merge_transcripts(mic_result, sys_result):
     }
 
 
-def _normalize(audio, target_rms=0.05, peak_headroom_db=1.0):
-    """Normalize audio to target RMS with peak headroom to prevent clipping.
+def _normalise(audio, target_rms=0.05, peak_headroom_db=1.0):
+    """Normalise audio to target RMS with peak headroom to prevent clipping.
 
     Scales to target_rms unless that would push peaks above the ceiling
     (-peak_headroom_db from full scale). In that case, gain is reduced
@@ -1798,7 +1883,7 @@ def _istft(stft_matrix, hop_length=512, length=None):
         start = i * hop_length
         output[start:start + n_fft] += frame * window
         window_sum[start:start + n_fft] += window ** 2
-    # Normalize by window overlap
+    # Normalise by window overlap
     nonzero = window_sum > 1e-8
     output[nonzero] /= window_sum[nonzero]
     if length is not None:
@@ -1985,8 +2070,8 @@ def _transcribe_chunk(chunk, model_name, language="en"):
         _cleanup_temp_files(tmp_path)
 
 
-def _diarize_mlx_audio(audio_path):
-    """Run speaker diarization using MLX Sortformer (fast, Apple GPU).
+def _diarise_mlx_audio(audio_path):
+    """Run speaker diarisation using MLX Sortformer (fast, Apple GPU).
 
     Uses streaming mode to keep RAM usage low on 16GB machines.
     Max 4 speakers (architectural limit of Sortformer model).
@@ -2030,10 +2115,10 @@ def _diarize_mlx_audio(audio_path):
     return turns
 
 
-def _diarize_standalone(audio_path):
-    """Run speaker diarization using MLX Sortformer."""
+def _diarise_standalone(audio_path):
+    """Run speaker diarisation using MLX Sortformer."""
     t0 = time.time()
-    turns = _diarize_mlx_audio(audio_path)
+    turns = _diarise_mlx_audio(audio_path)
     _log("diar_standalone", file=Path(audio_path).name, time=f"{time.time()-t0:.1f}s")
     return turns
 
@@ -2093,11 +2178,10 @@ def cmd_run(args):
     language = args.language or config["language"]
 
     title = args.title
-    no_diarize = args.no_diarize
+    no_diarise = args.no_diarise
     force_denoise = args.denoise
     no_denoise = args.no_denoise
-    normalize_cfg = config["normalize"]
-    normalize_enabled = normalize_cfg["enabled"]
+    normalise_enabled = config.get("normalise", True)
     ram_msg = check_ram_for_model(model_name)
     if ram_msg:
         print(f"  {ram_msg}")
@@ -2109,7 +2193,7 @@ def cmd_run(args):
 
     if not HF_TOKEN:
         print()
-        print("  ⚠  HF_TOKEN not set — speaker diarization will be skipped.")
+        print("  ⚠  HF_TOKEN not set — speaker diarisation will be skipped.")
         print("  Set it with: export HF_TOKEN=your_token_here")
         print()
 
@@ -2121,8 +2205,8 @@ def cmd_run(args):
     speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
     speed_factor *= 0.15  # MLX GPU acceleration
     estimated_time = audio_duration * speed_factor
-    diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
-    if diarize_enabled:
+    diarise_enabled = config["diarization"]["enabled"] and not no_diarise and HF_TOKEN
+    if diarise_enabled:
         estimated_time += audio_duration * 0.05  # Sortformer: ~3s per minute
 
     is_parakeet_model = _is_parakeet(model_name)
@@ -2137,18 +2221,18 @@ def cmd_run(args):
     is_stereo_input = _is_stereo(audio_path)
     engine_label = "mlx-audio (GPU)" if is_parakeet_model else "mlx-whisper (GPU)"
     model_size = MODEL_INFO.get(model_name, {}).get("size", "?")
-    diar_label = "Sortformer (GPU)" if diarize_enabled else "off"
+    diar_label = "Sortformer (GPU)" if diarise_enabled else "off"
     denoise_label = f"spectral sub {denoise_factor}x" if denoise_enabled else "off"
     channels_label = "stereo (mic + system)" if is_stereo_input else "mono"
 
     denoise_prefix = "Denoise → " if denoise_enabled else ""
     if is_stereo_input:
-        if diarize_enabled:
-            steps_preview = f"{denoise_prefix}Diarize system → Transcribe mic + system → Save"
+        if diarise_enabled:
+            steps_preview = f"{denoise_prefix}Diarise system → Transcribe mic + system → Save"
         else:
             steps_preview = f"{denoise_prefix}Transcribe mic + system → Save"
-    elif diarize_enabled:
-        steps_preview = f"{denoise_prefix}Diarize → Transcribe → Save"
+    elif diarise_enabled:
+        steps_preview = f"{denoise_prefix}Diarise → Transcribe → Save"
     else:
         steps_preview = f"{denoise_prefix}Transcribe → Save"
 
@@ -2161,8 +2245,8 @@ def cmd_run(args):
         ("Model:", f"{model_name} ({model_size})"),
         ("Language:", language),
         ("Denoise:", denoise_label),
-        ("Normalize:", f"{normalize_cfg['target_rms']} RMS" if normalize_enabled else "off"),
-        ("Diarize:", diar_label),
+        ("Normalise:", "0.05 RMS" if normalise_enabled else "off"),
+        ("Diarise:", diar_label),
         ("Pipeline:", steps_preview),
         ("Est time:", f"~{format_duration(estimated_time)}"),
         ("Started:", datetime.now().strftime("%H:%M:%S")),
@@ -2172,7 +2256,7 @@ def cmd_run(args):
     print()
 
     # Pipeline steps
-    if diarize_enabled:
+    if diarise_enabled:
         step_names = ["Identifying speakers", "Transcribing", "Saving"]
     else:
         step_names = ["Transcribing", "Saving"]
@@ -2184,7 +2268,7 @@ def cmd_run(args):
     progress.start()
 
     denoised_path = None
-    normalized_path = None
+    normalised_path = None
     result = None
     try:
         step = 0
@@ -2198,18 +2282,16 @@ def cmd_run(args):
         else:
             transcribe_path = audio_path
 
-        # ── Normalize ──
-        target_rms = normalize_cfg["target_rms"]
-        headroom = normalize_cfg["peak_headroom_db"]
-        if normalize_enabled and not is_stereo_input:
+        # ── Normalise ──
+        if normalise_enabled and not is_stereo_input:
             import soundfile as sf
             audio_data = _load_audio(transcribe_path, sr=SAMPLE_RATE)
-            audio_data = _normalize(audio_data, target_rms=target_rms, peak_headroom_db=headroom)
+            audio_data = _normalise(audio_data)
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix=".norm_")
             os.close(tmp_fd)
             sf.write(tmp_path, audio_data, SAMPLE_RATE)
-            normalized_path = tmp_path
-            transcribe_path = normalized_path
+            normalised_path = tmp_path
+            transcribe_path = normalised_path
 
         import mlx.core as mx
 
@@ -2217,26 +2299,26 @@ def cmd_run(args):
             # ── Stereo pipeline: transcribe each channel independently ──
             mic_path, sys_path = _split_stereo(transcribe_path)
 
-            # Normalize each channel independently
-            if normalize_enabled:
+            # Normalise each channel independently
+            if normalise_enabled:
                 import soundfile as sf
                 for ch_path in (mic_path, sys_path):
                     ch_audio = _load_audio(ch_path, sr=SAMPLE_RATE)
-                    ch_audio = _normalize(ch_audio, target_rms=target_rms, peak_headroom_db=headroom)
+                    ch_audio = _normalise(ch_audio)
                     sf.write(ch_path, ch_audio, SAMPLE_RATE)
 
-            diarize_mic = config["audio"]["diarize_mic"]
+            diarise_mic = config["audio"]["diarise_mic"]
             try:
-                # Diarize system channel (remote speakers) — always when enabled
+                # Diarise system channel (remote speakers) — always when enabled
                 sys_speaker_turns = None
                 mic_speaker_turns = None
-                if diarize_enabled:
+                if diarise_enabled:
                     progress.set_step(step)  # Identifying speakers
-                    sys_speaker_turns = _diarize_standalone(sys_path)
-                    if diarize_mic:
+                    sys_speaker_turns = _diarise_standalone(sys_path)
+                    if diarise_mic:
                         gc.collect()
                         mx.clear_cache()
-                        mic_speaker_turns = _diarize_standalone(mic_path)
+                        mic_speaker_turns = _diarise_standalone(mic_path)
                     gc.collect()
                     mx.clear_cache()
                     step += 1
@@ -2261,7 +2343,7 @@ def cmd_run(args):
 
                 # Assign speaker labels — mic channel
                 if mic_speaker_turns:
-                    # Conference room: diarize mic to separate local speakers
+                    # Conference room: diarise mic to separate local speakers
                     mic_result["segments"] = _assign_speakers_to_segments(
                         mic_result.get("segments", []), mic_speaker_turns)
                     # Prefix local speakers to distinguish from remote
@@ -2288,16 +2370,16 @@ def cmd_run(args):
             # ── Mono pipeline: original behavior ──
             speaker_turns = None
 
-            if diarize_enabled:
+            if diarise_enabled:
                 progress.set_step(step)  # Identifying speakers
-                speaker_turns = _diarize_standalone(transcribe_path)
+                speaker_turns = _diarise_standalone(transcribe_path)
                 gc.collect()
                 mx.clear_cache()
                 step += 1
 
             progress.set_step(step)  # Transcribing
             result = _transcribe_audio(transcribe_path, model_name, language,
-                                       word_timestamps=not diarize_enabled)
+                                       word_timestamps=not diarise_enabled)
 
             if speaker_turns is not None:
                 result["segments"] = _assign_speakers_to_segments(
@@ -2309,18 +2391,18 @@ def cmd_run(args):
     except Exception as e:
         progress.stop()
         print(f"\n\n  ❌ Transcription failed: {e}")
-        # If we got partial results (e.g., transcription OK but diarization crashed),
+        # If we got partial results (e.g., transcription OK but diarisation crashed),
         # checkpoint what we have
         if result is not None:
             cp_path = _save_checkpoint(result, audio_path, title)
             if cp_path:
                 print(f"  ✅ Partial transcription saved to: {cp_path}")
-                print(f"  💡 Re-run with --no-diarize to use the transcription without speakers.")
+                print(f"  💡 Re-run with --no-diarise to use the transcription without speakers.")
         return
     finally:
         _cleanup_temp_files(
             denoised_path if denoised_path != audio_path else None,
-            normalized_path,
+            normalised_path,
         )
 
     progress.stop()
@@ -2371,21 +2453,21 @@ def cmd_run(args):
             except OSError:
                 pass
 
-        # Log run to history for benchmarking
         step_log = {}
-        if hasattr(progress, '_step_times'):
-            for i, name in enumerate(step_names):
-                if i in progress._step_times:
-                    step_log[name] = progress._step_times[i]
+        for i, name in enumerate(step_names):
+            if i in progress._step_times:
+                step_log[name] = progress._step_times[i]
         _log_run({
-            "model": model_name,
-            "engine": "mlx",
-            "language": language,
+            "model": model_name, "mode": "run", "title": title,
             "audio_duration": round(audio_duration, 1),
             "processing_time": round(total_time, 1),
             "segments": len(result.get("segments") or []),
             "speakers": len(speaker_names),
             "audio_file": Path(audio_path).name,
+            "denoise": denoise_enabled,
+            "normalise": normalise_enabled,
+            "diarise": diarise_enabled,
+            "stereo": is_stereo_input,
         }, step_log)
 
     except Exception as e:
@@ -2497,7 +2579,7 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
     """Format transcription result as Obsidian-friendly Markdown.
 
     metadata: optional dict with keys like model, engine, audio_duration,
-              processing_time, language, diarization, audio_file.
+              processing_time, language, diarisation, audio_file.
     """
     meta = metadata or {}
     lines = []
@@ -2584,7 +2666,7 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
 
 
 def _rename_speakers(result):
-    """Rename diarization speaker IDs (SPEAKER_00 → Speaker 1)."""
+    """Rename diarisation speaker IDs (SPEAKER_00 → Speaker 1)."""
     segments = result.get("segments") or []
     speaker_ids = sorted(set(seg.get("speaker", "Unknown") for seg in segments))
     name_map = {}
@@ -2815,7 +2897,7 @@ def cmd_watch(args):
                  "live",
                  "--model", model_name,
                  "--title", safe_title,
-                 "--no-diarize"],
+                 "--no-diarise"],
                 stdin=subprocess.DEVNULL,
             )
 
@@ -2875,7 +2957,7 @@ def cmd_watch(args):
                                  "run", str(latest),
                                  "--model", model_name,
                                  "--title", safe_title,
-                                 "--no-diarize"],
+                                 "--no-diarise"],
                                 stdin=subprocess.DEVNULL,
                                 timeout=3600,
                             )
@@ -2898,7 +2980,7 @@ def cmd_install_daemon(args):
         return
 
     if not HF_TOKEN:
-        print("  ⚠  HF_TOKEN not set — diarization won't work in background daemon.")
+        print("  ⚠  HF_TOKEN not set — diarisation won't work in background daemon.")
         print("     Set it with: export HF_TOKEN=your_token_here")
         print("     Then re-run: transcribe install-daemon")
         print()
@@ -3050,7 +3132,7 @@ Examples:
     run_parser.add_argument("--model", "-m", default=None, help="Model: parakeet/small.en/medium/large-v3")
     run_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     run_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
-    run_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
+    run_parser.add_argument("--no-diarise", action="store_true", help="Skip speaker identification (faster)")
     run_parser.add_argument("--denoise", action="store_true", help="Enable denoising (off by default)")
     run_parser.add_argument("--no-denoise", action="store_true", help="Force denoising OFF (overrides config)")
     run_parser.add_argument("--debug", action="store_true", help="Enable pipeline debug logging")
@@ -3060,7 +3142,7 @@ Examples:
     live_parser.add_argument("--model", "-m", default=None, help="Model (default: from config)")
     live_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     live_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
-    live_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
+    live_parser.add_argument("--no-diarise", action="store_true", help="Skip speaker identification (faster)")
 
     # watch
     watch_parser = subparsers.add_parser("watch", help="Auto-record meetings from calendar")
@@ -3075,7 +3157,7 @@ Examples:
     subparsers.add_parser("list", help="List recordings")
 
     # history
-    subparsers.add_parser("history", help="Show transcription run history and model benchmarks")
+    subparsers.add_parser("history", help="Show transcription history and model stats")
 
     # setup
     subparsers.add_parser("setup", help="Set up audio devices for recording")
