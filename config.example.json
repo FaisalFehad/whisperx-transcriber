@@ -6,7 +6,7 @@
     "language": "en",
 
     "paths": {
-        "obsidian_base": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Sessions",
+        "base": "~/Transcriptions",
         "recordings_subdir": "Recordings",
         "scripts_subdir": "Scripts"
     },

@@ -36,7 +36,6 @@ except ImportError:
     _SCK_AVAILABLE = False
 
 
-
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -58,8 +57,8 @@ DEFAULT_CONFIG = {
     # ── File paths ───────────────────────────────────────────────────────
     "paths": {
         # Root folder for recordings and transcripts
-        "obsidian_base": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Sessions",
-        # Subfolders under obsidian_base (created automatically)
+        "base": "~/Transcriptions",
+        # Subfolders under base (created automatically)
         "recordings_subdir": "Recordings",
         "scripts_subdir": "Scripts",
     },
@@ -260,18 +259,16 @@ def load_config():
 config = load_config()
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-OBSIDIAN_BASE = Path(os.path.expanduser(config["paths"]["obsidian_base"]))
-RECORDINGS_DIR = OBSIDIAN_BASE / config["paths"]["recordings_subdir"]
-SCRIPTS_DIR = OBSIDIAN_BASE / config["paths"]["scripts_subdir"]
+BASE_DIR = Path(os.path.expanduser(config["paths"]["base"]))
+RECORDINGS_DIR = BASE_DIR / config["paths"]["recordings_subdir"]
+SCRIPTS_DIR = BASE_DIR / config["paths"]["scripts_subdir"]
 
 SAMPLE_RATE = config["recording"]["sample_rate"]
 SILENCE_THRESHOLD = config["recording"]["silence_threshold"]
 SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 
 AUDIO_FORMATS = tuple(config["audio_formats"])
-VIRTUAL_DEVICE_NAMES = tuple(config.get("recording", {}).get(
-    "virtual_device_names", ["Aggregate", "Multi-Output"]
-))
+VIRTUAL_DEVICE_NAMES = tuple(config["recording"]["virtual_device_names"])
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 
 MODEL_INFO = config["models"]
@@ -286,7 +283,6 @@ def _log(tag, **kwargs):
         return
     parts = " ".join(f"{k}={v}" for k, v in kwargs.items())
     print(f"  [{tag}] {parts}", file=sys.stderr, flush=True)
-STEP_NAMES = ["Transcribing", "Saving"]  # default; overridden by cmd_run with actual pipeline steps
 
 
 # ─── Safe File Writing ────────────────────────────────────────────────────────
@@ -366,7 +362,7 @@ def _diagnose_write_error(err):
                 "Check if the drive is mounted read-only or if iCloud sync is paused.")
     if "No such file or directory" in msg:
         return ("The destination folder doesn't exist and couldn't be created.",
-                "Check the paths.obsidian_base setting in config.json.")
+                "Check the paths.base setting in config.json.")
     return (str(err), "Check the error above and fix the issue.")
 
 
@@ -661,8 +657,6 @@ def cmd_history(args):
         print(f"  {'Model':<14} {'Runs':>5} {'Avg Speed':>10} {'Min':>7} {'Max':>7}")
         print(f"  {'─'*14} {'─'*5} {'─'*10} {'─'*7} {'─'*7}")
         for model, speeds in sorted(model_stats.items()):
-            if not speeds:
-                continue
             avg = sum(speeds) / len(speeds)
             print(f"  {model:<14} {len(speeds):>5} {avg:>9.1f}x {min(speeds):>6.1f}x {max(speeds):>6.1f}x")
 
@@ -689,6 +683,15 @@ def level_meter(rms, width=20):
 def spinner_char(tick):
     chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     return chars[tick % len(chars)]
+
+
+def _rms_emoji(rms):
+    """Return a colored emoji for an RMS level."""
+    if rms > 0.01:
+        return "🟢"
+    if rms > 0.003:
+        return "🟡"
+    return "🔴"
 
 
 def get_available_ram_gb():
@@ -730,7 +733,6 @@ def check_ram_for_model(model_name):
     return None
 
 
-
 # ─── Audio Device Detection ───────────────────────────────────────────────────
 
 def _cleanup_temp_files(*paths):
@@ -751,18 +753,23 @@ def _transcribe_audio(audio_path, model_name, language="en", **kwargs):
 
 
 def _setup_audio_devices():
-    """Get audio device info and recording path. Returns (mic_id, mic_name, dual_mode, source_label, output_path)."""
+    """Get audio device info and recording path. Returns (mic_id, mic_name, dual_mode, source_label, output_path) or raises."""
     mic_id, mic_name = get_default_mic()
+    if mic_id is None:
+        print("  ❌ No microphone found. Check your audio devices: transcribe setup")
+        raise RuntimeError("No microphone found")
     dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_path = RECORDINGS_DIR / f"{timestamp}.wav"
+    output_path = _unique_path(RECORDINGS_DIR / f"{timestamp}.wav")
     return mic_id, mic_name, dual_mode, source_label, output_path
 
 
 def _save_transcript(result, audio_path, title, model_name, language,
                      audio_duration, processing_time, cp_path=None):
     """Save transcription result as Markdown. Returns (output_file, speaker_names)."""
+    if not title:
+        title = Path(audio_path).stem.replace("_", " ").replace("-", " ").title()
     speaker_names = _rename_speakers(result)
     date_str = extract_recording_date(str(audio_path))
     metadata = {
@@ -776,7 +783,9 @@ def _save_transcript(result, audio_path, title, model_name, language,
     markdown = format_transcript(result, title, speaker_names, date_str, metadata)
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title).strip()
+    if not safe_title:
+        safe_title = "Untitled"
     output_file = SCRIPTS_DIR / f"{date_str} {safe_title}.md"
     saved_to = _safe_write_text(output_file, markdown, description="transcript")
     if saved_to:
@@ -817,7 +826,6 @@ def get_default_mic():
 
 
 
-
 def cmd_setup(args):
     """Check audio setup status."""
     import sounddevice as sd
@@ -845,13 +853,17 @@ def cmd_setup(args):
 
     print()
     print("  Input devices:")
+    found_devices = False
     for i, d in enumerate(sd.query_devices()):
         if d["max_input_channels"] > 0:
+            found_devices = True
             markers = []
             if i == mic_id:
                 markers.append("active mic")
             tag = f" ← {', '.join(markers)}" if markers else ""
             print(f"    [{i}] {d['name']} ({d['max_input_channels']}ch){tag}")
+    if not found_devices:
+        print("    ❌ No input devices found. Check that a mic is connected.")
     print()
 
 
@@ -864,7 +876,10 @@ def cmd_record(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+    try:
+        mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+    except RuntimeError:
+        return
 
     from ui import info_panel
     print()
@@ -1118,11 +1133,17 @@ def cmd_live(args):
 
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model_name = args.model or config["live"].get("model", config["default_model"])
+    model_name = args.model or config["live"]["model"]
+    valid_models = set(MODEL_INFO.keys()) | set(config["mlx_models"].keys())
+    if model_name not in valid_models:
+        print(f"  ❌ Unknown model '{model_name}'")
+        print(f"  Available: {', '.join(sorted(MODEL_INFO.keys()))}")
+        return
+
     language = args.language or config["language"]
     chunk_interval = config["live"]["chunk_interval_seconds"]
-    no_diarize = getattr(args, "no_diarize", False)
-    title = getattr(args, "title", None)
+    no_diarize = args.no_diarize
+    title = args.title
 
     # ── Pre-load model ──────────────────────────────────────────────────
     from ui import console
@@ -1131,15 +1152,23 @@ def cmd_live(args):
     console.print(Panel("[bold]🎙 Live Record + Transcribe[/bold]", border_style="dim", expand=False, width=54))
     print()
     print(f"  Loading '{model_name}' model...")
-    if _is_parakeet(model_name):
-        from mlx_audio.stt import load as load_stt
-        _parakeet_model = load_stt(config.get("mlx_models", {}).get(model_name, "mlx-community/parakeet-tdt-0.6b-v3"))
-    else:
-        import mlx_whisper
+    try:
+        if _is_parakeet(model_name):
+            from mlx_audio.stt import load as load_stt
+            load_stt(config["mlx_models"].get(model_name, "mlx-community/parakeet-tdt-0.6b-v3"))
+        else:
+            import mlx_whisper
+    except Exception as e:
+        print(f"  ❌ Failed to load model '{model_name}': {e}")
+        print(f"  Check your internet connection — models download on first use.")
+        return
     print(f"  ✅ Model ready — starting recording")
 
     # ── Find audio devices ────────────────────────────────────────────────
-    mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+    try:
+        mic_id, mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+    except RuntimeError:
+        return
 
     from ui import info_panel
     print()
@@ -1172,13 +1201,13 @@ def cmd_live(args):
     stop_event = threading.Event()
 
     # ── Adaptive chunking state ───────────────────────────────────────────
-    live_cfg = config.get("live", {})
+    live_cfg = config["live"]
     adaptive = {
         "interval": chunk_interval,
-        "min_interval": live_cfg.get("min_chunk_interval", 60),
-        "max_interval": live_cfg.get("max_chunk_interval", 300),
-        "struggle_ratio": live_cfg.get("struggle_ratio", 0.7),
-        "rec_only_ratio": live_cfg.get("rec_only_ratio", 1.5),
+        "min_interval": live_cfg["min_chunk_interval"],
+        "max_interval": live_cfg["max_chunk_interval"],
+        "struggle_ratio": live_cfg["struggle_ratio"],
+        "rec_only_ratio": live_cfg["rec_only_ratio"],
         "rec_only": False,
         "status_msg": "",
     }
@@ -1259,9 +1288,8 @@ def cmd_live(args):
     def transcription_worker():
         """Background thread: transcribe chunks during recording with adaptive pacing."""
         nonlocal last_transcribed_sample, chunks_done, chunk_in_progress
-        live_cfg = config.get("live", {})
-        overlap_seconds = live_cfg.get("chunk_overlap_seconds", 5)
-        min_chunk_secs = live_cfg.get("min_chunk_seconds", 30)
+        overlap_seconds = live_cfg["chunk_overlap_seconds"]
+        min_chunk_secs = live_cfg["min_chunk_seconds"]
         overlap_samples = int(SAMPLE_RATE * overlap_seconds)
 
         while not stop_event.is_set():
@@ -1333,7 +1361,7 @@ def cmd_live(args):
 
     transcription_thread = threading.Thread(target=transcription_worker, daemon=True)
     auto_stopped = False
-    _last_adaptive_msg = [""]  # mutable container so inner scope can read it
+    last_adaptive_msg = ""
 
     try:
         mic_stream.start()
@@ -1352,23 +1380,9 @@ def cmd_live(args):
             silence_elapsed = time.time() - sil if sil else 0
 
             # ── Quality indicators (green/yellow/red) ──
-            if m_rms > 0.01:
-                mic_status = "🟢"
-            elif m_rms > 0.003:
-                mic_status = "🟡"
-            else:
-                mic_status = "🔴"
-
+            quality = f"Mic{_rms_emoji(m_rms)}"
             if dual_mode:
-                if b_rms > 0.01:
-                    sys_status = "🟢"
-                elif b_rms > 0.003:
-                    sys_status = "🟡"
-                else:
-                    sys_status = "🔴"
-                quality = f"Mic{mic_status} Sys{sys_status}"
-            else:
-                quality = f"Mic{mic_status}"
+                quality += f" Sys{_rms_emoji(b_rms)}"
 
             # ── Mic low warning (10+ seconds) ──
             mic_warn = ""
@@ -1396,10 +1410,10 @@ def cmd_live(args):
             )
 
             # Show adaptive warning on a separate line
-            if adaptive["status_msg"] and adaptive["status_msg"] != _last_adaptive_msg[0]:
+            if adaptive["status_msg"] and adaptive["status_msg"] != last_adaptive_msg:
                 clear_line()
                 print(f"  {adaptive['status_msg']}")
-                _last_adaptive_msg[0] = adaptive["status_msg"]
+                last_adaptive_msg = adaptive["status_msg"]
             clear_line()
             sys.stdout.write(status_line)
             sys.stdout.flush()
@@ -1427,8 +1441,6 @@ def cmd_live(args):
 
     if not mic_frames:
         print("  ⚠  No audio recorded.")
-        del model
-        gc.collect()
         return
 
     print()
@@ -1469,7 +1481,7 @@ def cmd_live(args):
         except Exception as e:
             print(f"  ⚠  Transcription failed: {e}")
 
-    overlap_seconds = config.get("live", {}).get("chunk_overlap_seconds", 5)
+    overlap_seconds = live_cfg["chunk_overlap_seconds"]
     if remaining > SAMPLE_RATE * overlap_seconds:
         remaining_duration = remaining / SAMPLE_RATE
         print(f"  ⏳ Transcribing final {format_duration(remaining_duration)}...")
@@ -1494,9 +1506,6 @@ def cmd_live(args):
         except Exception as e:
             print(f"  ⚠  Final chunk failed: {e}")
 
-    # Free model memory
-    if _is_parakeet(model_name) and '_parakeet_model' in dir():
-        del _parakeet_model
     gc.collect()
 
     all_segments = sorted(transcribed_segments, key=lambda s: s.get("start", 0))
@@ -1507,10 +1516,10 @@ def cmd_live(args):
     result = {"segments": all_segments, "language": language}
 
     # ── Diarization ─────────────────────────────────────────────────────
-    diarize_enabled = config["diarization"]["enabled"] and not no_diarize
-    if diarize_enabled and not HF_TOKEN:
+    diarize_enabled = config["diarization"]["enabled"] and not no_diarize and HF_TOKEN
+    if config["diarization"]["enabled"] and not no_diarize and not HF_TOKEN:
         print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
-    if HF_TOKEN and diarize_enabled:
+    if diarize_enabled:
         print("  ⏳ Identifying speakers...")
         try:
             # For stereo files, diarize system channel only
@@ -1584,11 +1593,9 @@ class ProgressTracker:
     Uses Rich Live for in-place rendering (no scrolling).
     """
 
-    def __init__(self, audio_duration, model_name):
+    def __init__(self):
         from ui import console
         from rich.live import Live
-        self.audio_duration = audio_duration
-        self.model_name = model_name
         self.start_time = time.time()
         self.step_start_time = time.time()
         self.current_step = 0
@@ -1597,14 +1604,7 @@ class ProgressTracker:
         self._live = Live("", console=console, auto_refresh=False)
         self._completed = []  # [(name, duration_str)]
         self._step_times = {}
-        self.step_names = STEP_NAMES  # can be overridden before start()
-        # Keep step_weights for compatibility (used by callers for estimated_total)
-        # MLX + Sortformer: transcription dominates time
-        self.step_weights = [0.05, 0.65, 0.10, 0.15, 0.05]
-        speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
-        speed_factor *= 0.15  # MLX GPU acceleration
-        diar_time = audio_duration * 0.05  # Sortformer is fast
-        self.estimated_total = max(10, audio_duration * speed_factor + diar_time)
+        self.step_names = ["Transcribing", "Saving"]  # overridden by callers
 
     def start(self):
         self._step_times.clear()
@@ -1672,9 +1672,12 @@ class ProgressTracker:
 
 def _is_stereo(audio_path):
     """Check if an audio file is stereo (2 channels)."""
-    import soundfile as sf
-    info = sf.info(str(audio_path))
-    return info.channels == 2
+    try:
+        import soundfile as sf
+        info = sf.info(str(audio_path))
+        return info.channels == 2
+    except Exception:
+        return False  # assume mono if file can't be read
 
 
 def _split_stereo(audio_path, sr=16000):
@@ -1818,12 +1821,12 @@ def _denoise_audio(audio_path):
     Returns (denoised_path, elapsed_seconds) or (original_path, 0) if
     denoising is disabled or fails.
     """
-    denoise_cfg = config.get("denoise", {})
+    denoise_cfg = config["denoise"]
 
     import soundfile as sf
 
-    factor = denoise_cfg.get("factor", 2.0)
-    profile_secs = denoise_cfg.get("noise_profile_seconds", 3)
+    factor = denoise_cfg["factor"]
+    profile_secs = denoise_cfg["noise_profile_seconds"]
     sr = SAMPLE_RATE
 
     try:
@@ -1849,8 +1852,8 @@ def _denoise_audio(audio_path):
         else:
             noise_clip = audio[:profile_samples]
 
-        n_fft = denoise_cfg.get("n_fft", 2048)
-        hop = denoise_cfg.get("hop_length", 512)
+        n_fft = denoise_cfg["n_fft"]
+        hop = denoise_cfg["hop_length"]
 
         noise_stft = _stft(noise_clip, n_fft=n_fft, hop_length=hop)
         noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
@@ -1894,8 +1897,7 @@ def _denoise_audio(audio_path):
 
 def _get_mlx_repo(model_name):
     """Get HuggingFace repo ID for an MLX whisper model."""
-    mlx_models = config.get("mlx_models", {})
-    return mlx_models.get(model_name, f"mlx-community/whisper-{model_name}-mlx")
+    return config["mlx_models"].get(model_name, f"mlx-community/whisper-{model_name}-mlx")
 
 
 def _transcribe_mlx(audio_path, model_name, language="en", word_timestamps=True):
@@ -1905,7 +1907,7 @@ def _transcribe_mlx(audio_path, model_name, language="en", word_timestamps=True)
 
     # hallucination_silence_threshold skips silent segments where hallucination
     # is detected. Requires word_timestamps=True to work.
-    hst = config.get("whisper", {}).get("hallucination_silence_threshold", 2.0)
+    hst = config["whisper"]["hallucination_silence_threshold"]
     if hst is not None:
         word_timestamps = True  # Required for HST
 
@@ -1939,8 +1941,8 @@ def _transcribe_parakeet(audio_path, model_name="parakeet"):
     """
     from mlx_audio.stt import load as load_stt
 
-    repo = config.get("mlx_models", {}).get(model_name, "mlx-community/parakeet-tdt-0.6b-v3")
-    chunk_dur = config.get("parakeet", {}).get("chunk_duration", 30.0)
+    repo = config["mlx_models"].get(model_name, "mlx-community/parakeet-tdt-0.6b-v3")
+    chunk_dur = config["parakeet"]["chunk_duration"]
     model = load_stt(repo)
     result = model.generate(audio_path, chunk_duration=chunk_dur, verbose=False)
 
@@ -1993,11 +1995,11 @@ def _diarize_mlx_audio(audio_path):
     import mlx.core as mx
 
     diar_config = config["diarization"]
-    model_id = diar_config.get("mlx_model", "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16")
-    chunk_duration = diar_config.get("mlx_chunk_duration", 10.0)
-    threshold = diar_config.get("threshold", 0.5)
-    min_duration = diar_config.get("min_duration", 0.0)
-    merge_gap = diar_config.get("merge_gap", 0.0)
+    model_id = diar_config["mlx_model"]
+    chunk_duration = diar_config["mlx_chunk_duration"]
+    threshold = diar_config["threshold"]
+    min_duration = diar_config["min_duration"]
+    merge_gap = diar_config["merge_gap"]
 
     model = load_vad(model_id)
 
@@ -2060,7 +2062,7 @@ def _assign_speakers_to_segments(segments, speaker_turns):
 def cmd_run(args):
     """Transcribe an audio file with progress tracking."""
     global _DEBUG
-    if getattr(args, "debug", False):
+    if args.debug:
         _DEBUG = True
 
     audio_path = args.audio
@@ -2074,24 +2076,33 @@ def cmd_run(args):
     if not os.path.exists(audio_path):
         print(f"  ❌ File not found: {audio_path}")
         return
+    if os.path.getsize(audio_path) == 0:
+        print(f"  ❌ File is empty: {audio_path}")
+        return
 
-    model_name = getattr(args, "model", None) or config["default_model"]
-    if not getattr(args, "model", None) and sys.stdin.isatty():
+    model_name = args.model or config["default_model"]
+    if not args.model and sys.stdin.isatty():
         model_name = prompt_model_selection()
 
-    language = getattr(args, "language", None) or config["language"]
+    valid_models = set(MODEL_INFO.keys()) | set(config["mlx_models"].keys())
+    if model_name not in valid_models:
+        print(f"  ❌ Unknown model '{model_name}'")
+        print(f"  Available: {', '.join(sorted(MODEL_INFO.keys()))}")
+        return
 
-    title = getattr(args, "title", None)
-    no_diarize = getattr(args, "no_diarize", False)
-    force_denoise = getattr(args, "denoise", False)
-    no_denoise = getattr(args, "no_denoise", False)
-    normalize_cfg = config.get("normalize", {})
-    normalize_enabled = normalize_cfg.get("enabled", True)
+    language = args.language or config["language"]
+
+    title = args.title
+    no_diarize = args.no_diarize
+    force_denoise = args.denoise
+    no_denoise = args.no_denoise
+    normalize_cfg = config["normalize"]
+    normalize_enabled = normalize_cfg["enabled"]
     ram_msg = check_ram_for_model(model_name)
     if ram_msg:
         print(f"  {ram_msg}")
 
-    if not title and config.get("auto_title_from_calendar", True):
+    if not title and config["auto_title_from_calendar"]:
         title = get_current_event_title()
     if not title:
         title = Path(audio_path).stem.replace("_", " ").replace("-", " ").title()
@@ -2120,8 +2131,8 @@ def cmd_run(args):
     elif no_denoise:
         denoise_enabled = False
     else:
-        denoise_enabled = config.get("denoise", {}).get("enabled", False)
-    denoise_factor = config.get("denoise", {}).get("factor", 2.0)
+        denoise_enabled = config["denoise"]["enabled"]
+    denoise_factor = config["denoise"]["factor"]
 
     is_stereo_input = _is_stereo(audio_path)
     engine_label = "mlx-audio (GPU)" if is_parakeet_model else "mlx-whisper (GPU)"
@@ -2150,7 +2161,7 @@ def cmd_run(args):
         ("Model:", f"{model_name} ({model_size})"),
         ("Language:", language),
         ("Denoise:", denoise_label),
-        ("Normalize:", f"{normalize_cfg.get('target_rms', 0.05)} RMS" if normalize_enabled else "off"),
+        ("Normalize:", f"{normalize_cfg['target_rms']} RMS" if normalize_enabled else "off"),
         ("Diarize:", diar_label),
         ("Pipeline:", steps_preview),
         ("Est time:", f"~{format_duration(estimated_time)}"),
@@ -2163,31 +2174,23 @@ def cmd_run(args):
     # Pipeline steps
     if diarize_enabled:
         step_names = ["Identifying speakers", "Transcribing", "Saving"]
-        step_weights = [0.15, 0.80, 0.05]
     else:
         step_names = ["Transcribing", "Saving"]
-        step_weights = [0.90, 0.10]
-
-    # Prepend denoising step if enabled
     if denoise_enabled:
         step_names = ["Denoising audio"] + step_names
-        # Denoising is fast (~2s) — give it a small weight
-        step_weights = [0.02] + [w * 0.98 for w in step_weights]
 
-    progress = ProgressTracker(audio_duration, model_name)
+    progress = ProgressTracker()
     progress.step_names = step_names
-    progress.step_weights = step_weights
     progress.start()
 
-    denoised_path = None  # Track temp file for cleanup
-    normalized_path = None  # Track temp file for cleanup
+    denoised_path = None
+    normalized_path = None
     result = None
     try:
         step = 0
 
         # ── Denoise (off by default, enable with --denoise flag, mono only) ──
-        is_stereo_file = _is_stereo(audio_path)
-        if denoise_enabled and not is_stereo_file:
+        if denoise_enabled and not is_stereo_input:
             progress.set_step(step)
             denoised_path, denoise_time = _denoise_audio(audio_path)
             transcribe_path = denoised_path
@@ -2196,9 +2199,9 @@ def cmd_run(args):
             transcribe_path = audio_path
 
         # ── Normalize ──
-        target_rms = normalize_cfg.get("target_rms", 0.05)
-        headroom = normalize_cfg.get("peak_headroom_db", 1.0)
-        if normalize_enabled and not is_stereo_file:
+        target_rms = normalize_cfg["target_rms"]
+        headroom = normalize_cfg["peak_headroom_db"]
+        if normalize_enabled and not is_stereo_input:
             import soundfile as sf
             audio_data = _load_audio(transcribe_path, sr=SAMPLE_RATE)
             audio_data = _normalize(audio_data, target_rms=target_rms, peak_headroom_db=headroom)
@@ -2210,7 +2213,7 @@ def cmd_run(args):
 
         import mlx.core as mx
 
-        if is_stereo_file:
+        if is_stereo_input:
             # ── Stereo pipeline: transcribe each channel independently ──
             mic_path, sys_path = _split_stereo(transcribe_path)
 
@@ -2222,7 +2225,7 @@ def cmd_run(args):
                     ch_audio = _normalize(ch_audio, target_rms=target_rms, peak_headroom_db=headroom)
                     sf.write(ch_path, ch_audio, SAMPLE_RATE)
 
-            diarize_mic = config.get("audio", {}).get("diarize_mic", False)
+            diarize_mic = config["audio"]["diarize_mic"]
             try:
                 # Diarize system channel (remote speakers) — always when enabled
                 sys_speaker_turns = None
@@ -2362,7 +2365,7 @@ def cmd_run(args):
         subprocess.run(["open", str(output_file.parent)], check=False)
 
         # Delete source recording if configured
-        if not config.get("audio", {}).get("keep_recording", True):
+        if not config["audio"]["keep_recording"]:
             try:
                 Path(audio_path).unlink()
             except OSError:
@@ -2409,7 +2412,7 @@ def cmd_list(args):
     from rich.table import Table
     from rich.panel import Panel
 
-    max_list = config.get("list", {}).get("max_recordings", 20)
+    max_list = config["list"]["max_recordings"]
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column("st", width=2)
     table.add_column("num", style="dim", width=3)
@@ -2501,7 +2504,7 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
 
     # YAML frontmatter
     lines.append("---")
-    lines.append(f"title: \"{title}\"")
+    lines.append(f"title: \"{title.replace(chr(34), chr(39))}\"")  # escape double quotes
     lines.append(f"date: {date_str}")
     lines.append("type: transcript")
     speaker_list = ", ".join(speaker_names.values())
@@ -2580,7 +2583,6 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
     return "\n".join(lines)
 
 
-
 def _rename_speakers(result):
     """Rename diarization speaker IDs (SPEAKER_00 → Speaker 1)."""
     segments = result.get("segments") or []
@@ -2590,6 +2592,8 @@ def _rename_speakers(result):
         name_map[sid] = f"Speaker {i + 1}"
     if len(name_map) > 1:
         print(f"  🔊 {len(name_map)} speakers detected")
+    if len(name_map) >= 4:
+        print(f"  ⚠  Sortformer supports max 4 speakers per channel — some speakers may be merged")
     _log("speakers", count=len(name_map), labels=list(name_map.values()))
     return name_map
 
@@ -2674,7 +2678,7 @@ def get_today_events(calendars=None):
 def get_current_event_title():
     """Return the title of the calendar event happening right now, or None."""
     try:
-        events = get_today_events(config.get("watch", {}).get("calendars", []))
+        events = get_today_events(config["watch"]["calendars"])
         now = datetime.now()
         for event in events:
             if event["start"] <= now <= event["end"]:
@@ -2707,14 +2711,14 @@ def cmd_watch(args):
     import signal
     from datetime import timedelta
 
-    watch_cfg = config.get("watch", {})
-    silence_timeout = watch_cfg.get("silence_timeout_minutes", 10)
-    min_recording = watch_cfg.get("min_recording_minutes", 2)
-    model_name = watch_cfg.get("model", config.get("default_model", "parakeet"))
-    end_buffer = watch_cfg.get("end_buffer_minutes", 2)
-    calendars = watch_cfg.get("calendars", []) or []
-    refresh_hours = watch_cfg.get("refresh_hours", 3)
-    record_only = watch_cfg.get("record_only", True)
+    watch_cfg = config["watch"]
+    silence_timeout = watch_cfg["silence_timeout_minutes"]
+    min_recording = watch_cfg["min_recording_minutes"]
+    model_name = watch_cfg["model"]
+    end_buffer = watch_cfg["end_buffer_minutes"]
+    calendars = watch_cfg["calendars"] or []
+    refresh_hours = watch_cfg["refresh_hours"]
+    record_only = watch_cfg["record_only"]
 
     _watch_log("📅 Calendar Watch started")
     from ui import info_panel
@@ -3043,7 +3047,7 @@ Examples:
     # run
     run_parser = subparsers.add_parser("run", help="Transcribe a recording")
     run_parser.add_argument("audio", nargs="?", default=None, help="Audio file path")
-    run_parser.add_argument("--model", "-m", default=None, help="Model: parakeet/small.en/medium/turbo/large-v3")
+    run_parser.add_argument("--model", "-m", default=None, help="Model: parakeet/small.en/medium/large-v3")
     run_parser.add_argument("--title", "-t", default=None, help="Transcript title")
     run_parser.add_argument("--language", "-l", default=None, help="Language code (default: from config)")
     run_parser.add_argument("--no-diarize", action="store_true", help="Skip speaker identification (faster)")
@@ -3078,26 +3082,22 @@ Examples:
 
     args = parser.parse_args()
 
-    if args.command == "rec":
-        cmd_record(args)
-    elif args.command == "run":
-        cmd_run(args)
-    elif args.command == "live":
-        cmd_live(args)
-    elif args.command == "watch":
-        cmd_watch(args)
-    elif args.command == "install-daemon":
-        cmd_install_daemon(args)
-    elif args.command == "uninstall-daemon":
-        cmd_uninstall_daemon(args)
-    elif args.command == "watch-status":
-        cmd_watch_status(args)
-    elif args.command == "list":
-        cmd_list(args)
-    elif args.command == "history":
-        cmd_history(args)
-    elif args.command == "setup":
-        cmd_setup(args)
+    commands = {
+        "rec": cmd_record,
+        "run": cmd_run,
+        "live": cmd_live,
+        "watch": cmd_watch,
+        "install-daemon": cmd_install_daemon,
+        "uninstall-daemon": cmd_uninstall_daemon,
+        "watch-status": cmd_watch_status,
+        "list": cmd_list,
+        "history": cmd_history,
+        "setup": cmd_setup,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        handler(args)
     else:
         parser.print_help()
         print()

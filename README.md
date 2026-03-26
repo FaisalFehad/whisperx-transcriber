@@ -219,7 +219,7 @@ Parakeet also produces properly punctuated, capitalized text out of the box.
 Transcripts are saved as Markdown with YAML frontmatter:
 
 ```
-Output Folder/
+~/Transcriptions/
 ├── Recordings/          # Audio files
 │   └── 2026-03-19_14-30-00.wav
 └── Scripts/             # Transcripts
@@ -292,7 +292,7 @@ Spectral subtraction pre-processing. **Off by default** — eval tests showed al
 
 | Key                       | Default                            | What it does                               |
 | ------------------------- | ---------------------------------- | ------------------------------------------ |
-| `paths.obsidian_base`     | `"~/Library/Mobile Documents/..."` | Root folder for recordings and transcripts |
+| `paths.base`              | `"~/Transcriptions"`               | Root folder for recordings and transcripts |
 | `paths.recordings_subdir` | `"Recordings"`                     | Subfolder for audio files                  |
 | `paths.scripts_subdir`    | `"Scripts"`                        | Subfolder for transcript Markdown files    |
 

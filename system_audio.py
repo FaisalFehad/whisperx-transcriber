@@ -221,7 +221,7 @@ class SystemAudioCapture:
                 return
 
             displays = content.displays()
-            if not displays or len(displays) == 0:
+            if not displays:
                 self._err = "no display found (SCContentFilter requires a display)"
                 self._ready.set()
                 return
