@@ -1,4 +1,4 @@
-"""Shared Rich-based UI components for whisperx-transcriber."""
+"""Shared Rich-based UI components for local-transcribe."""
 
 import select
 import sys

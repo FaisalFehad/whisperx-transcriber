@@ -1,8 +1,6 @@
-# Local-Transcriber
+# Local Transcriber
 
-Lightweight simple local speech-to-text for macOS. Record meetings, lectures, podcasts, or any audio — get accurate transcripts with speaker labels, blazing fast, no subscriptions, no data leaving your machine.
-
-This tool processes everything on-device using Apple Silicon GPU acceleration. Your audio stays on your disk, your transcripts stay in your vault. No accounts, no subscriptions, no data sharing.
+Fast, private speech-to-text for macOS. Record meetings, lectures, podcasts, or any audio — get accurate transcripts with speaker labels. Everything runs on your Mac's GPU. No cloud, no subscriptions, no data leaves your machine.
 
 ## Features
 
@@ -16,7 +14,7 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 - **99 languages** — via Whisper models (Parakeet supports English + 25 European languages)
 - **Multiple formats** — MP3, WAV, M4A, OGG, FLAC, WebM
 
-### Recording (configurable)
+### Recording
 
 - **System audio + mic** — captures both sides of Zoom, Teams, Meet via ScreenCaptureKit
 - **No virtual devices** — volume keys work normally, no Audio MIDI Setup configuration
@@ -55,20 +53,18 @@ This tool processes everything on-device using Apple Silicon GPU acceleration. Y
 
 ## Requirements
 
-- macOS with Apple Silicon
+- macOS with Apple Silicon (M1/M2/M3/M4)
 - Python 3.10+
-- Screen Recording permission (macOS prompts on first use — needed for system audio capture via ScreenCaptureKit)
+- ffmpeg (`brew install ffmpeg`)
+- Screen Recording permission (macOS prompts on first use)
 
 ## Install
 
 ```bash
-    git clone https://github.com/FaisalFehad/whisperx-transcriber.git
-    cd whisperx-transcriber
-
-    ./install.sh
-    source ~/.zshrc
-
-    transcribe rec # To transcribe live system and external audio, Control + C to stop recording and save
+git clone https://github.com/FaisalFehad/local-transcribe.git
+cd local-transcribe
+./install.sh
+source ~/.zshrc
 ```
 
 The installer creates a virtual environment, installs dependencies, and adds the `transcribe` command to your shell.
@@ -215,7 +211,7 @@ Parakeet also produces properly punctuated, capitalized text out of the box.
 | Use case                 | Model                | Why                                           |
 | ------------------------ | -------------------- | --------------------------------------------- |
 | **General use**          | `parakeet` (default) | Best accuracy, blazing fast no hallucinations |
-| **Low RAM (< 8GB free)** | `small.en`           | Only 460MB - decent alternative parakeet      |
+| **Low RAM (< 8GB free)** | `small.en`           | Only 460MB — decent alternative to parakeet   |
 | **Non-English**          | `medium`             | 99 languages via Whisper                      |
 
 ## Output
@@ -290,7 +286,7 @@ Spectral subtraction pre-processing. **Off by default** — eval tests showed al
 | ------------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
 | `denoise.enabled`               | `false` | Enable denoising (or use `--denoise` flag)                                                      |
 | `denoise.factor`                | `2.0`   | Noise subtraction aggressiveness. Higher = more removal but risks distortion                    |
-| `denoise.noise_profile_seconds` | `10`    | Seconds from start of audio used as noise sample. Works best when recording starts with silence |
+| `denoise.noise_profile_seconds` | `3`     | Seconds of audio used as noise sample. Automatically finds the quietest window in the file |
 
 ### Paths
 

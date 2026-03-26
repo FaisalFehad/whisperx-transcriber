@@ -2,8 +2,8 @@
 # Transcriber — Install Script
 #
 # Usage:
-#   git clone https://github.com/FaisalFehad/whisperx-transcriber.git
-#   cd whisperx-transcriber
+#   git clone https://github.com/FaisalFehad/local-transcribe.git
+#   cd local-transcribe
 #   ./install.sh
 
 set -e
