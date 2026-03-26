@@ -1,6 +1,6 @@
 # Local Transcriber
 
-Fast, private speech-to-text for macOS. Record meetings, transcribe with speaker labels — everything runs on your Mac's GPU. No cloud, no subscriptions, no data leaves your machine.
+Simple speech-to-text for macOS. Record anything, get accurate transcripts with speaker labels. No data leaving your machine, no subscriptions, no bloat.
 
 ## Get Started in 60 Seconds
 
@@ -52,32 +52,32 @@ A 1-hour meeting transcribes in ~4 minutes. The transcript is ready before you f
 
 ## Commands
 
-| Command | What it does |
-|---------|-------------|
-| `transcribe rec` | Record system audio + mic (auto-stops on silence) |
-| `transcribe run [file]` | Transcribe a recording or audio file |
-| `transcribe live` | Record + transcribe simultaneously |
-| `transcribe list` | Browse past recordings |
-| `transcribe watch` | Auto-record meetings from your calendar |
-| `transcribe setup` | Check audio device setup |
+| Command                 | What it does                                      |
+| ----------------------- | ------------------------------------------------- |
+| `transcribe rec`        | Record system audio + mic (auto-stops on silence) |
+| `transcribe run [file]` | Transcribe a recording or audio file              |
+| `transcribe live`       | Record + transcribe simultaneously                |
+| `transcribe list`       | Browse past recordings                            |
+| `transcribe watch`      | Auto-record meetings from your calendar           |
+| `transcribe setup`      | Check audio device setup                          |
 
 ### Options
 
-| Flag | Example | What it does |
-|------|---------|-------------|
-| `-m` | `-m medium` | Use a different model (default: parakeet) |
-| `-t` | `-t "Team Meeting"` | Set the transcript title |
-| `-l` | `-l ar` | Set language (default: en) |
-| `--no-diarise` | | Skip speaker identification (faster) |
+| Flag           | Example             | What it does                              |
+| -------------- | ------------------- | ----------------------------------------- |
+| `-m`           | `-m medium`         | Use a different model (default: parakeet) |
+| `-t`           | `-t "Team Meeting"` | Set the transcript title                  |
+| `-l`           | `-l ar`             | Set language (default: en)                |
+| `--no-diarise` |                     | Skip speaker identification (faster)      |
 
 ## Models
 
-| Model | Speed | RAM | Best for |
-|-------|-------|-----|----------|
+| Model                  | Speed       | RAM        | Best for                                           |
+| ---------------------- | ----------- | ---------- | -------------------------------------------------- |
 | **parakeet** (default) | **~15x RT** | **~2.5GB** | **General use — best accuracy, no hallucinations** |
-| small.en | ~15x RT | ~460MB | Low RAM, English-only |
-| medium | ~7x RT | ~1.5GB | Multilingual (99 languages) |
-| large-v3 | ~4x RT | ~3GB | Most capable Whisper (slow) |
+| small.en               | ~15x RT     | ~460MB     | Low RAM, English-only                              |
+| medium                 | ~7x RT      | ~1.5GB     | Multilingual (99 languages)                        |
+| large-v3               | ~4x RT      | ~3GB       | Most capable Whisper (slow)                        |
 
 **Why Parakeet?** CTC architecture maps audio directly to text — **cannot hallucinate**. No "Thank Thank Thank..." on silence. Proper punctuation and capitalisation out of the box.
 
@@ -119,21 +119,21 @@ cp config.example.json config.json
 
 Any value you omit uses the built-in default. See [`config.example.json`](config.example.json) for all options.
 
-| Setting | Default | What it does |
-|---------|---------|--------------|
-| `default_model` | `"parakeet"` | Transcription model |
-| `language` | `"en"` | Language code |
-| `normalise` | `true` | Volume normalisation before transcription |
-| `diarization.enabled` | `true` | Speaker identification |
-| `paths.base` | `"~/Transcriptions"` | Where to save recordings and transcripts |
+| Setting               | Default              | What it does                              |
+| --------------------- | -------------------- | ----------------------------------------- |
+| `default_model`       | `"parakeet"`         | Transcription model                       |
+| `language`            | `"en"`               | Language code                             |
+| `normalise`           | `true`               | Volume normalisation before transcription |
+| `diarization.enabled` | `true`               | Speaker identification                    |
+| `paths.base`          | `"~/Transcriptions"` | Where to save recordings and transcripts  |
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| No audio recorded | Run `transcribe setup` to check your mic |
+| Problem                   | Fix                                                  |
+| ------------------------- | ---------------------------------------------------- |
+| No audio recorded         | Run `transcribe setup` to check your mic             |
 | System audio not captured | Grant Screen Recording permission in System Settings |
-| No speaker labels | Set `HF_TOKEN` (see Setup above) |
+| No speaker labels         | Set `HF_TOKEN` (see Setup above)                     |
 
 ## Uninstall
 
