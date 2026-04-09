@@ -1,10 +1,9 @@
 #!/bin/bash
-# Interview Transcriber — Record, transcribe, save to Obsidian
-#
+
 # Usage:
-#   transcribe rec                              Record an interview
+#   transcribe rec                              start recording (press Ctrl+C to stop)
 #   transcribe run                              Transcribe last recording
-#   transcribe run ~/Downloads/interview.mp3    Transcribe a specific file
+#   transcribe run ~/Downloads/recording.mp3    Transcribe a specific file
 #   transcribe list                             List & manage recordings
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

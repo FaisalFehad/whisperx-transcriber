@@ -9,20 +9,20 @@
 #   - Cached models (~/.cache/huggingface)
 #   - Shell alias from .zshrc
 #   - Config file
-#   - Optionally: recordings and transcripts from Obsidian
+#   - Optionally: recordings and transcripts
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SHELL_RC="$HOME/.zshrc"
 # Read output paths from config.json if it exists, otherwise use defaults
-DEFAULT_BASE="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Interviews"
+DEFAULT_BASE="$HOME/Transcriptions"
 if [ -f "$SCRIPT_DIR/config.json" ] && command -v python3 &>/dev/null; then
     CONFIG_BASE=$(python3 -c "
 import json, os
 with open('$SCRIPT_DIR/config.json') as f:
     c = json.load(f)
-base = c.get('paths', {}).get('obsidian_base', '$DEFAULT_BASE')
+base = c.get('paths', {}).get('base', '$DEFAULT_BASE')
 print(os.path.expanduser(base))
 " 2>/dev/null) || CONFIG_BASE="$DEFAULT_BASE"
 else
@@ -42,8 +42,8 @@ try:
         print(json.load(f).get('paths', {}).get('scripts_subdir', 'Scripts'))
 except: print('Scripts')
 " 2>/dev/null) || SCRIPTS_SUBDIR="Scripts"
-OBSIDIAN_RECORDINGS="$CONFIG_BASE/$REC_SUBDIR"
-OBSIDIAN_SCRIPTS="$CONFIG_BASE/$SCRIPTS_SUBDIR"
+RECORDINGS_DIR="$CONFIG_BASE/$REC_SUBDIR"
+TRANSCRIPTS_DIR="$CONFIG_BASE/$SCRIPTS_SUBDIR"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.transcriber.watch.plist"
 
 echo ""
@@ -86,13 +86,18 @@ else
     echo "  ─  No log files found"
 fi
 
-# ─── Remove config file ──────────────────────────────────────────────────────
+# ─── Remove config and history files ─────────────────────────────────────────
 
 if [ -f "$SCRIPT_DIR/config.json" ]; then
     rm -f "$SCRIPT_DIR/config.json"
     echo "  ✅ Removed config.json"
 else
     echo "  ─  No config.json found"
+fi
+
+if [ -f "$SCRIPT_DIR/history.jsonl" ]; then
+    rm -f "$SCRIPT_DIR/history.jsonl"
+    echo "  ✅ Removed history.jsonl"
 fi
 
 # ─── Remove virtual environment ──────────────────────────────────────────────
@@ -115,13 +120,13 @@ if [ "$remove_cache" = "y" ] || [ "$remove_cache" = "Y" ]; then
             -name "*whisper*" -o \
             -name "*parakeet*" -o \
             -name "*sortformer*" \
-        \) -exec rm -rf {} + 2>/dev/null
+        \) -exec rm -rf {} + 2>/dev/null || true
         echo "  ✅ Removed cached transcription/diarisation models"
     fi
 
     # CTranslate2 whisper models
-    if ls "$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-"* 1>/dev/null 2>&1; then
-        rm -rf "$HOME/.cache/huggingface/hub/models--Systran--faster-whisper-"*
+    if find "$HOME/.cache/huggingface/hub" -maxdepth 1 -type d -name "models--Systran--faster-whisper-*" 2>/dev/null | grep -q .; then
+        find "$HOME/.cache/huggingface/hub" -maxdepth 1 -type d -name "models--Systran--faster-whisper-*" -exec rm -rf {} + 2>/dev/null || true
         echo "  ✅ Removed cached faster-whisper models"
     fi
 else
@@ -133,7 +138,6 @@ fi
 echo ""
 if grep -q "alias transcribe=" "$SHELL_RC" 2>/dev/null; then
     sed -i '' '/# Transcriber$/d' "$SHELL_RC"
-    sed -i '' '/# Interview Transcriber/d' "$SHELL_RC"
     sed -i '' '/alias transcribe=/d' "$SHELL_RC"
     echo "  ✅ Removed 'transcribe' alias from $SHELL_RC"
 else
@@ -143,11 +147,13 @@ fi
 # ─── Remove recordings and transcripts ───────────────────────────────────────
 
 echo ""
-if [ -d "$OBSIDIAN_RECORDINGS" ] || [ -d "$OBSIDIAN_SCRIPTS" ]; then
-    read -p "  Remove recordings and transcripts from Obsidian? [y/N] " remove_obsidian
-    if [ "$remove_obsidian" = "y" ] || [ "$remove_obsidian" = "Y" ]; then
-        [ -d "$OBSIDIAN_RECORDINGS" ] && rm -rf "$OBSIDIAN_RECORDINGS" && echo "  ✅ Removed $OBSIDIAN_RECORDINGS"
-        [ -d "$OBSIDIAN_SCRIPTS" ] && rm -rf "$OBSIDIAN_SCRIPTS" && echo "  ✅ Removed $OBSIDIAN_SCRIPTS"
+if [ -d "$RECORDINGS_DIR" ] || [ -d "$TRANSCRIPTS_DIR" ]; then
+    [ -d "$RECORDINGS_DIR" ] && echo "  ·  $RECORDINGS_DIR"
+    [ -d "$TRANSCRIPTS_DIR" ] && echo "  ·  $TRANSCRIPTS_DIR"
+    read -p "  Remove the above recordings and transcripts? [y/N] " remove_files
+    if [ "$remove_files" = "y" ] || [ "$remove_files" = "Y" ]; then
+        [ -d "$RECORDINGS_DIR" ] && rm -rf "$RECORDINGS_DIR" && echo "  ✅ Removed $RECORDINGS_DIR"
+        [ -d "$TRANSCRIPTS_DIR" ] && rm -rf "$TRANSCRIPTS_DIR" && echo "  ✅ Removed $TRANSCRIPTS_DIR"
     else
         echo "  ─  Keeping recordings and transcripts"
     fi
@@ -165,7 +171,6 @@ echo "│                                             │"
 echo "│  Reload your shell:  source ~/.zshrc        │"
 echo "│                                             │"
 echo "│  To fully remove, delete this folder:       │"
-echo "│    rm -rf $SCRIPT_DIR"
-echo "│                                             │"
 echo "└─────────────────────────────────────────────┘"
+echo "    rm -rf $SCRIPT_DIR"
 echo ""
