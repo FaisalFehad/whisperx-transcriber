@@ -4,6 +4,8 @@
 
     "default_model": "parakeet",
     "language": "en",
+    "_comment3": "Set keychain to true to read HF_TOKEN from macOS keychain instead of the HF_TOKEN env var.",
+    "keychain": false,
 
     "paths": {
         "base": "~/Transcriptions",

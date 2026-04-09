@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     "default_model": "parakeet",
     # Language code for transcription (e.g. "en", "ar", "fr")
     "language": "en",
+    # Read HF_TOKEN from macOS keychain instead of environment variable
+    "keychain": False,
 
     # ── File paths ───────────────────────────────────────────────────────
     "paths": {
@@ -251,7 +253,15 @@ def load_config():
 # Load config and apply
 config = load_config()
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+if config.get("keychain"):
+    import subprocess
+    _r = subprocess.run(
+        ["security", "find-generic-password", "-s", "HF_TOKEN", "-a", os.environ.get("USER", ""), "-w"],
+        capture_output=True, text=True
+    )
+    HF_TOKEN = _r.stdout.strip() if _r.returncode == 0 else ""
+else:
+    HF_TOKEN = os.environ.get("HF_TOKEN", "")
 BASE_DIR = Path(os.path.expanduser(config["paths"]["base"]))
 RECORDINGS_DIR = BASE_DIR / config["paths"]["recordings_subdir"]
 SCRIPTS_DIR = BASE_DIR / config["paths"]["scripts_subdir"]
@@ -2576,7 +2586,7 @@ def get_audio_duration(audio_path):
 
 
 def format_transcript(result, title, speaker_names, date_str, metadata=None):
-    """Format transcription result as Obsidian-friendly Markdown.
+    """Format transcription result as Markdown.
 
     metadata: optional dict with keys like model, engine, audio_duration,
               processing_time, language, diarisation, audio_file.
