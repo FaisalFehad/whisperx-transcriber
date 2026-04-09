@@ -61,6 +61,15 @@ pip install -e "$SCRIPT_DIR" -q
 
 echo "  ✅ Dependencies installed"
 
+# ─── Create config file ──────────────────────────────────────────────────────
+
+if [ -f "$SCRIPT_DIR/config.json" ]; then
+    echo "  ✅ config.json already exists"
+else
+    cp "$SCRIPT_DIR/config.example.json" "$SCRIPT_DIR/config.json"
+    echo "  ✅ Created config.json from example"
+fi
+
 # ─── Make shell wrapper executable ────────────────────────────────────────────
 
 chmod +x "$SCRIPT_DIR/transcribe"
