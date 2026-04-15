@@ -29,11 +29,9 @@ from pathlib import Path
 import numpy as np
 
 try:
-    from system_audio import SystemAudioCapture as _SystemAudioCapture, is_available as _sck_is_available
-    _SCK_AVAILABLE = _sck_is_available()
+    from system_audio import SystemAudioCapture as _SystemAudioCapture
 except ImportError:
     _SystemAudioCapture = None
-    _SCK_AVAILABLE = False
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -247,14 +245,14 @@ def load_config():
         except (json.JSONDecodeError, OSError) as e:
             print(f"  ⚠  Error reading config.json: {e}")
             print("     Using default settings.")
-    return DEFAULT_CONFIG.copy()
+    import copy
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 # Load config and apply
 config = load_config()
 
 if config.get("keychain"):
-    import subprocess
     _r = subprocess.run(
         ["security", "find-generic-password", "-s", "HF_TOKEN", "-a", os.environ.get("USER", ""), "-w"],
         capture_output=True, text=True
@@ -262,7 +260,7 @@ if config.get("keychain"):
     HF_TOKEN = _r.stdout.strip() if _r.returncode == 0 else ""
 else:
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
-BASE_DIR = Path(os.path.expanduser(config["paths"]["base"]))
+BASE_DIR = Path(config["paths"]["base"]).expanduser()
 RECORDINGS_DIR = BASE_DIR / config["paths"]["recordings_subdir"]
 SCRIPTS_DIR = BASE_DIR / config["paths"]["scripts_subdir"]
 
@@ -538,10 +536,6 @@ def _remove_checkpoint(cp_path):
             Path(cp_path).unlink()
         except OSError:
             pass
-
-
-# ─── Run History ─────────────────────────────────────────────────────────────
-
 
 
 # ─── History Logging ─────────────────────────────────────────────────────────
@@ -888,7 +882,7 @@ def cmd_setup(args):
     import sounddevice as sd
 
     mic_id, mic_name = get_default_mic()
-    sck_status = "✅ ScreenCaptureKit (system audio)" if _SCK_AVAILABLE else "❌ pip install pyobjc-framework-ScreenCaptureKit"
+    sck_status = "✅ ScreenCaptureKit (system audio)" if _SystemAudioCapture is not None else "❌ pip install pyobjc-framework-ScreenCaptureKit"
 
     from ui import info_panel
     print()
@@ -897,7 +891,7 @@ def cmd_setup(args):
         ("Mic:", mic_name),
     ])
 
-    if _SCK_AVAILABLE:
+    if _SystemAudioCapture is not None:
         print()
         print("  ✅ Ready! System audio is captured via ScreenCaptureKit.")
         print("     No virtual audio drivers needed.")
@@ -994,13 +988,9 @@ def cmd_record(args):
     blocksize = int(SAMPLE_RATE * 0.5)
     current_mic_id = mic_id
 
-    def _create_mic_stream(dev_id):
-        return sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            device=dev_id, blocksize=blocksize, callback=mic_callback,
-        )
+    create_stream = lambda dev_id: _make_mic_stream(dev_id, blocksize, mic_callback)
 
-    mic_stream = _create_mic_stream(mic_id)
+    mic_stream = create_stream(mic_id)
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
@@ -1057,7 +1047,7 @@ def cmd_record(args):
 
                 # Check for mic device change (e.g. AirPods connected/disconnected)
                 mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
-                    mic_stream, current_mic_id, _create_mic_stream, paused=paused)
+                    mic_stream, current_mic_id, create_stream, paused=paused)
                 if switched:
                     mic_name = new_name
                     with lock:
@@ -1087,10 +1077,13 @@ def cmd_record(args):
         return
 
     audio_data = _mix_audio(mic_frames, sys_frames, dual_mode,
+                            normalise=config.get("normalise", True),
                             mic_switch_points=mic_switch_frames if mic_switch_frames else None)
     saved_to = _safe_write_audio(output_path, audio_data, SAMPLE_RATE, description="recording")
-    if saved_to:
-        output_path = saved_to
+    if not saved_to:
+        print("  ⚠  Recording not saved.")
+        return
+    output_path = saved_to
 
     from ui import success_panel
     stop_reason = f"Auto-stopped after {SILENCE_TIMEOUT // 60}min silence" if auto_stopped else "Recording stopped"
@@ -1210,6 +1203,50 @@ def prompt_model_selection():
         print("  Invalid choice, try again.")
 
 
+# ─── Shared Helpers ──────────────────────────────────────────────────────────
+
+def _validate_model(model_name):
+    """Check model name is valid. Returns True if valid, prints error and returns False if not."""
+    valid_models = set(MODEL_INFO.keys()) | set(config["mlx_models"].keys())
+    if model_name not in valid_models:
+        print(f"  ❌ Unknown model '{model_name}'")
+        print(f"  Available: {', '.join(sorted(valid_models))}")
+        return False
+    return True
+
+
+def _check_diarise(no_diarise):
+    """Check if diarisation is enabled; warn if HF_TOKEN is missing. Returns bool."""
+    wanted = config["diarization"]["enabled"] and not no_diarise
+    if wanted and not HF_TOKEN:
+        print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
+        return False
+    return wanted
+
+
+def _make_mic_stream(dev_id, blocksize, callback):
+    """Create a sounddevice InputStream for mic recording."""
+    import sounddevice as sd
+    return sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+        device=dev_id, blocksize=blocksize, callback=callback,
+    )
+
+
+def _offset_and_filter_segments(segments, offset, overlap_boundary):
+    """Apply time offset to segments and keep only those whose midpoint exceeds overlap_boundary."""
+    result = []
+    for seg in segments:
+        start = seg.get("start", 0) + offset
+        end = seg.get("end", 0) + offset
+        seg["start"] = start
+        seg["end"] = end
+        # Midpoint filter: avoids cutting segments that straddle the boundary
+        if (start + end) / 2 > overlap_boundary:
+            result.append(seg)
+    return result
+
+
 # ─── Live Record + Transcribe ────────────────────────────────────────────────
 
 def cmd_live(args):
@@ -1220,10 +1257,7 @@ def cmd_live(args):
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     model_name = args.model or config["live"]["model"]
-    valid_models = set(MODEL_INFO.keys()) | set(config["mlx_models"].keys())
-    if model_name not in valid_models:
-        print(f"  ❌ Unknown model '{model_name}'")
-        print(f"  Available: {', '.join(sorted(MODEL_INFO.keys()))}")
+    if not _validate_model(model_name):
         return
 
     language = args.language or config["language"]
@@ -1408,15 +1442,8 @@ def cmd_live(args):
                 result = _transcribe_chunk(chunk, model_name, language)
                 process_seconds = time.time() - process_start
 
-                segments = result.get("segments", [])
-                for seg in segments:
-                    seg["start"] = seg.get("start", 0) + offset
-                    seg["end"] = seg.get("end", 0) + offset
-                # Keep segments whose midpoint is past the overlap boundary
-                segments = [
-                    s for s in segments
-                    if (s.get("start", 0) + s.get("end", 0)) / 2 > overlap_boundary
-                ]
+                segments = _offset_and_filter_segments(
+                    result.get("segments", []), offset, overlap_boundary)
                 with transcribe_lock:
                     transcribed_segments.extend(segments)
                 last_transcribed_sample = total_samples
@@ -1436,13 +1463,9 @@ def cmd_live(args):
     current_mic_id = mic_id
     mic_monitor = MicMonitor()
 
-    def _create_mic_stream(dev_id):
-        return sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            device=dev_id, blocksize=blocksize, callback=mic_callback,
-        )
+    create_stream = lambda dev_id: _make_mic_stream(dev_id, blocksize, mic_callback)
 
-    mic_stream = _create_mic_stream(mic_id)
+    mic_stream = create_stream(mic_id)
     sck_capture = None
     if _SystemAudioCapture is not None:
         try:
@@ -1496,7 +1519,7 @@ def cmd_live(args):
 
             # Check for mic device change
             mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
-                mic_stream, current_mic_id, _create_mic_stream)
+                mic_stream, current_mic_id, create_stream)
             if switched:
                 mic_name = new_name
                 mic_warn = f" Switched to {new_name}"
@@ -1553,10 +1576,13 @@ def cmd_live(args):
         print(f"  📊 {chunks_done} chunks pre-transcribed during recording")
 
     # ── Save audio file ───────────────────────────────────────────────────
-    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode)
+    audio_data = _mix_audio(mic_frames, sys_frames, dual_mode,
+                            normalise=config.get("normalise", True))
     saved_to = _safe_write_audio(output_path, audio_data, SAMPLE_RATE, description="recording")
-    if saved_to:
-        output_path = saved_to
+    if not saved_to:
+        print("  ⚠  Recording not saved.")
+        return
+    output_path = saved_to
     print(f"  📁 Saved: {output_path.name}")
 
     # ── Transcribe remaining audio ────────────────────────────────────────
@@ -1592,14 +1618,8 @@ def cmd_live(args):
 
         try:
             result = _transcribe_chunk(chunk, model_name, language)
-            segments = result.get("segments", [])
-            for seg in segments:
-                seg["start"] = seg.get("start", 0) + offset
-                seg["end"] = seg.get("end", 0) + offset
-            segments = [
-                s for s in segments
-                if (s.get("start", 0) + s.get("end", 0)) / 2 > overlap_boundary
-            ]
+            segments = _offset_and_filter_segments(
+                result.get("segments", []), offset, overlap_boundary)
             with transcribe_lock:
                 transcribed_segments.extend(segments)
         except Exception as e:
@@ -1607,7 +1627,8 @@ def cmd_live(args):
 
     gc.collect()
 
-    all_segments = sorted(transcribed_segments, key=lambda s: s.get("start", 0))
+    with transcribe_lock:
+        all_segments = sorted(transcribed_segments, key=lambda s: s.get("start", 0))
     if not all_segments:
         print("  ⚠  No speech detected.")
         return
@@ -1615,9 +1636,7 @@ def cmd_live(args):
     result = {"segments": all_segments, "language": language}
 
     # ── Diarisation ─────────────────────────────────────────────────────
-    diarise_enabled = config["diarization"]["enabled"] and not no_diarise and HF_TOKEN
-    if config["diarization"]["enabled"] and not no_diarise and not HF_TOKEN:
-        print("  ⚠  Skipping speaker ID — HF_TOKEN not set (see README)")
+    diarise_enabled = _check_diarise(no_diarise)
     if diarise_enabled:
         print("  ⏳ Identifying speakers...")
         try:
@@ -1639,9 +1658,6 @@ def cmd_live(args):
     cp_path = _save_checkpoint(result, str(output_path), title)
 
     try:
-        if not title:
-            title = Path(output_path).stem.replace("_", " ").replace("-", " ").title()
-
         post_time = time.time() - recording_end
         transcript_file, speaker_names = _save_transcript(
             result, str(output_path), title, model_name, language,
@@ -1790,8 +1806,12 @@ def _split_stereo(audio_path, sr=16000):
     sys_fd, sys_path = tempfile.mkstemp(suffix="_sys.wav")
     os.close(mic_fd)
     os.close(sys_fd)
-    sf.write(mic_path, mic, file_sr, subtype="PCM_16")
-    sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
+    try:
+        sf.write(mic_path, mic, file_sr, subtype="PCM_16")
+        sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
+    except Exception:
+        _cleanup_temp_files(mic_path, sys_path)
+        raise
     _log("split", duration=f"{len(mic)/file_sr:.1f}s",
          mic_rms=f"{np.sqrt(np.mean(mic**2)):.5f}",
          sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
@@ -1842,8 +1862,8 @@ def _normalise(audio, target_rms=0.05, peak_headroom_db=1.0):
     # Use the lesser — reach target RMS or stay under ceiling
     gain = min(rms_gain, peak_gain)
     audio = audio * gain
-    actual_rms = float(np.sqrt(np.mean(audio ** 2)))
-    actual_peak = float(np.max(np.abs(audio)))
+    actual_rms = rms * gain
+    actual_peak = peak * gain
     limited = "peak-limited" if gain < rms_gain else "rms-target"
     _log("norm", rms_in=f"{rms:.5f}", rms_out=f"{actual_rms:.5f}",
          gain=f"{gain:.2f}x", peak=f"{actual_peak:.3f}", mode=limited)
@@ -2136,17 +2156,25 @@ def _diarise_standalone(audio_path):
 def _assign_speakers_to_segments(segments, speaker_turns):
     """Match transcription segments to speaker turns by timestamp overlap.
 
-    Modifies segments in-place and returns a dict with segments key.
+    Uses bisect on turn end-times to skip non-overlapping turns,
+    reducing average complexity from O(segments × turns) to O(n log m + k).
+    Modifies segments in-place.
     """
+    import bisect
+    # Sort by end time so bisect can skip non-overlapping turns correctly
+    speaker_turns = sorted(speaker_turns, key=lambda t: t["end"])
+    turn_ends = [t["end"] for t in speaker_turns]
     for seg in segments:
         seg_start = seg.get("start", 0)
         seg_end = seg.get("end", 0)
         best_speaker = "Unknown"
         best_overlap = 0.0
-        for turn in speaker_turns:
-            overlap_start = max(seg_start, turn["start"])
-            overlap_end = min(seg_end, turn["end"])
-            overlap = max(0, overlap_end - overlap_start)
+        # First turn whose end > seg_start (earlier turns can't overlap)
+        idx = bisect.bisect_right(turn_ends, seg_start)
+        for turn in speaker_turns[idx:]:
+            if turn["start"] >= seg_end:
+                break  # remaining turns start after this segment
+            overlap = min(seg_end, turn["end"]) - max(seg_start, turn["start"])
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_speaker = turn["speaker"]
@@ -2179,10 +2207,7 @@ def cmd_run(args):
     if not args.model and sys.stdin.isatty():
         model_name = prompt_model_selection()
 
-    valid_models = set(MODEL_INFO.keys()) | set(config["mlx_models"].keys())
-    if model_name not in valid_models:
-        print(f"  ❌ Unknown model '{model_name}'")
-        print(f"  Available: {', '.join(sorted(MODEL_INFO.keys()))}")
+    if not _validate_model(model_name):
         return
 
     language = args.language or config["language"]
@@ -2201,11 +2226,7 @@ def cmd_run(args):
     if not title:
         title = Path(audio_path).stem.replace("_", " ").replace("-", " ").title()
 
-    if not HF_TOKEN:
-        print()
-        print("  ⚠  HF_TOKEN not set — speaker diarisation will be skipped.")
-        print("  Set it with: export HF_TOKEN=your_token_here")
-        print()
+    diarise_enabled = _check_diarise(no_diarise)
 
     audio_duration = get_audio_duration(audio_path)
     if audio_duration <= 0:
@@ -2215,7 +2236,6 @@ def cmd_run(args):
     speed_factor = MODEL_INFO.get(model_name, {}).get("speed_factor", 1.0)
     speed_factor *= 0.15  # MLX GPU acceleration
     estimated_time = audio_duration * speed_factor
-    diarise_enabled = config["diarization"]["enabled"] and not no_diarise and HF_TOKEN
     if diarise_enabled:
         estimated_time += audio_duration * 0.05  # Sortformer: ~3s per minute
 
@@ -2358,9 +2378,12 @@ def cmd_run(args):
                         mic_result.get("segments", []), mic_speaker_turns)
                     # Prefix local speakers to distinguish from remote
                     for seg in mic_result.get("segments", []):
-                        if seg.get("speaker", "").startswith("SPEAKER_"):
-                            parts = seg["speaker"].split("_")
-                            num = int(parts[1]) + 1 if len(parts) > 1 and parts[1].isdigit() else 1
+                        spk = seg.get("speaker", "")
+                        if spk.startswith("Speaker "):
+                            try:
+                                num = int(spk.split(" ", 1)[1]) + 1
+                            except (IndexError, ValueError):
+                                num = 1
                             seg["speaker"] = f"Local {num}"
                 else:
                     # Default: mic = "You"
@@ -2510,11 +2533,15 @@ def cmd_list(args):
     table.add_column("num", style="dim", width=3)
     table.add_column("name")
     table.add_column("info", style="dim")
+    # Pre-load transcript date prefixes to avoid re-globbing per recording
+    transcript_dates = set()
+    if SCRIPTS_DIR.exists():
+        for md in SCRIPTS_DIR.glob("*.md"):
+            transcript_dates.add(md.stem[:10])
     for i, rec in enumerate(recordings[:max_list], 1):
         duration = get_audio_duration(str(rec))
         size_mb = rec.stat().st_size / (1024 * 1024)
-        date_prefix = rec.stem[:10]
-        has_transcript = SCRIPTS_DIR.exists() and any(SCRIPTS_DIR.glob(f"{date_prefix}*.md"))
+        has_transcript = rec.stem[:10] in transcript_dates
         status = "✅" if has_transcript else ""
         table.add_row(status, f"{i})", rec.stem, f"{format_duration(duration)}, {size_mb:.1f}MB")
     print()
@@ -2635,7 +2662,6 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
     lines.append("")
 
     # Group consecutive segments by speaker
-    segments = result.get("segments") or []
     single_speaker = len(speaker_names) <= 1
     current_speaker = None
     current_text = []
@@ -2942,7 +2968,8 @@ def cmd_watch(args):
             return
 
         # ── Check if recording was too short ───────────────────
-        if proc.returncode == 0:
+        # Accept any exit except SIGKILL (which means we force-killed an unresponsive process)
+        if proc.returncode is not None and proc.returncode != -signal.SIGKILL:
             recordings = list_recordings(RECORDINGS_DIR)
             if recordings:
                 latest = recordings[0]
@@ -3106,11 +3133,13 @@ def cmd_watch_status(args):
         print(f"  📋 Log:   {WATCH_LOG}")
         # Show last 5 log lines
         try:
-            lines = WATCH_LOG.read_text().strip().split("\n")
+            from collections import deque
+            with open(WATCH_LOG) as f:
+                tail = deque(f, maxlen=5)
             print()
             print("  ── Recent activity ──")
-            for line in lines[-5:]:
-                print(f"  {line}")
+            for line in tail:
+                print(f"  {line.rstrip()}")
         except OSError:
             pass
     print()
