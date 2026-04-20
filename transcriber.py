@@ -1128,11 +1128,16 @@ def _mix_audio(mic_frames, sys_frames, dual_mode, normalise=True, mic_switch_poi
         sys_audio = np.concatenate(sys_frames)
         if normalise:
             sys_audio = _normalise(sys_audio)
-        min_len = min(len(mic_audio), len(sys_audio))
-        _log("mix", mode="stereo", normalise=normalise, samples=min_len,
-             mic_rms=f"{np.sqrt(np.mean(mic_audio[:min_len]**2)):.5f}",
-             sys_rms=f"{np.sqrt(np.mean(sys_audio[:min_len]**2)):.5f}")
-        return np.column_stack([mic_audio[:min_len], sys_audio[:min_len]])
+        # Pad shorter channel with silence rather than truncate — never drop speech.
+        max_len = max(len(mic_audio), len(sys_audio))
+        if len(mic_audio) < max_len:
+            mic_audio = np.concatenate([mic_audio, np.zeros(max_len - len(mic_audio), dtype=mic_audio.dtype)])
+        if len(sys_audio) < max_len:
+            sys_audio = np.concatenate([sys_audio, np.zeros(max_len - len(sys_audio), dtype=sys_audio.dtype)])
+        _log("mix", mode="stereo", normalise=normalise, samples=max_len,
+             mic_rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}",
+             sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
+        return np.column_stack([mic_audio, sys_audio])
     _log("mix", mode="mono", normalise=normalise, samples=len(mic_audio),
          rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}")
     return mic_audio
@@ -1594,6 +1599,7 @@ def cmd_live(args):
     total_samples = len(flat_audio)
     remaining = total_samples - last_transcribed_sample
 
+    overlap_seconds = live_cfg["chunk_overlap_seconds"]
     if adaptive["rec_only"] and last_transcribed_sample == 0:
         # Never managed to transcribe anything — do full file transcription
         remaining_duration = total_samples / SAMPLE_RATE
@@ -1605,9 +1611,7 @@ def cmd_live(args):
                 transcribed_segments.extend(segments)
         except Exception as e:
             print(f"  ⚠  Transcription failed: {e}")
-
-    overlap_seconds = live_cfg["chunk_overlap_seconds"]
-    if remaining > SAMPLE_RATE * overlap_seconds:
+    elif remaining > SAMPLE_RATE * overlap_seconds:
         remaining_duration = remaining / SAMPLE_RATE
         print(f"  ⏳ Transcribing final {format_duration(remaining_duration)}...")
         post_overlap = int(SAMPLE_RATE * overlap_seconds)
@@ -2156,24 +2160,20 @@ def _diarise_standalone(audio_path):
 def _assign_speakers_to_segments(segments, speaker_turns):
     """Match transcription segments to speaker turns by timestamp overlap.
 
-    Uses bisect on turn end-times to skip non-overlapping turns,
-    reducing average complexity from O(segments × turns) to O(n log m + k).
+    Sort turns by start so the break is safe (starts are monotonic).
     Modifies segments in-place.
     """
-    import bisect
-    # Sort by end time so bisect can skip non-overlapping turns correctly
-    speaker_turns = sorted(speaker_turns, key=lambda t: t["end"])
-    turn_ends = [t["end"] for t in speaker_turns]
+    speaker_turns = sorted(speaker_turns, key=lambda t: t["start"])
     for seg in segments:
         seg_start = seg.get("start", 0)
         seg_end = seg.get("end", 0)
         best_speaker = "Unknown"
         best_overlap = 0.0
-        # First turn whose end > seg_start (earlier turns can't overlap)
-        idx = bisect.bisect_right(turn_ends, seg_start)
-        for turn in speaker_turns[idx:]:
+        for turn in speaker_turns:
             if turn["start"] >= seg_end:
-                break  # remaining turns start after this segment
+                break
+            if turn["end"] <= seg_start:
+                continue
             overlap = min(seg_end, turn["end"]) - max(seg_start, turn["start"])
             if overlap > best_overlap:
                 best_overlap = overlap
@@ -2702,12 +2702,23 @@ def format_transcript(result, title, speaker_names, date_str, metadata=None):
 
 
 def _rename_speakers(result):
-    """Rename diarisation speaker IDs (SPEAKER_00 → Speaker 1)."""
+    """Rename raw diarisation IDs (SPEAKER_00 or "Speaker 0") to "Speaker 1..N".
+
+    Preserves human-readable labels set by the stereo pipeline (You, Remote,
+    Local N, Unknown, or a configured user_name).
+    """
+    import re
+    raw_pat = re.compile(r"^(SPEAKER_\d+|Speaker \d+)$")
     segments = result.get("segments") or []
     speaker_ids = sorted(set(seg.get("speaker", "Unknown") for seg in segments))
     name_map = {}
-    for i, sid in enumerate(speaker_ids):
-        name_map[sid] = f"Speaker {i + 1}"
+    counter = 1
+    for sid in speaker_ids:
+        if raw_pat.match(sid):
+            name_map[sid] = f"Speaker {counter}"
+            counter += 1
+        else:
+            name_map[sid] = sid
     if len(name_map) > 1:
         print(f"  🔊 {len(name_map)} speakers detected")
     if len(name_map) >= 4:
@@ -2723,9 +2734,11 @@ def get_today_events(calendars=None):
 
     Returns list of dicts: [{"title": str, "start": datetime, "end": datetime}, ...]
     """
-    # Build calendar filter
+    # Build calendar filter — escape quotes and backslashes to block AppleScript injection.
     if calendars:
-        cal_filter = " or ".join(f'name of its calendar is "{c}"' for c in calendars)
+        def _esc(s):
+            return s.replace("\\", "\\\\").replace('"', '\\"')
+        cal_filter = " or ".join(f'name of its calendar is "{_esc(c)}"' for c in calendars)
         cal_condition = f" and ({cal_filter})"
     else:
         cal_condition = ""
@@ -3022,42 +3035,21 @@ def cmd_install_daemon(args):
         print("     Then re-run: transcribe install-daemon")
         print()
 
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{venv_python}</string>
-        <string>{script_path}</string>
-        <string>watch</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{SCRIPT_DIR}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{SCRIPT_DIR}/watch-stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>{SCRIPT_DIR}/watch-stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HF_TOKEN</key>
-        <string>{HF_TOKEN}</string>
-    </dict>
-</dict>
-</plist>
-"""
+    import plistlib
+    env_vars = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
+    # Prefer keychain over embedding the token in a world-readable plist.
+    if not config.get("keychain") and HF_TOKEN:
+        env_vars["HF_TOKEN"] = HF_TOKEN
+    plist_data = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [str(venv_python), str(script_path), "watch"],
+        "WorkingDirectory": str(SCRIPT_DIR),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": str(SCRIPT_DIR / "watch-stdout.log"),
+        "StandardErrorPath": str(SCRIPT_DIR / "watch-stderr.log"),
+        "EnvironmentVariables": env_vars,
+    }
 
     # Create LaunchAgents directory if needed
     LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
@@ -3066,8 +3058,10 @@ def cmd_install_daemon(args):
     subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)],
                    capture_output=True)
 
-    # Write plist
-    LAUNCHD_PLIST.write_text(plist_content)
+    # Write plist (0600 — plist may contain HF_TOKEN if keychain is not enabled)
+    with open(LAUNCHD_PLIST, "wb") as f:
+        plistlib.dump(plist_data, f)
+    os.chmod(LAUNCHD_PLIST, 0o600)
 
     # Load daemon
     result = subprocess.run(["launchctl", "load", str(LAUNCHD_PLIST)],

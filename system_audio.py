@@ -12,6 +12,7 @@ After granting it the capture starts automatically on every subsequent run.
 """
 
 import ctypes
+import sys
 import threading
 
 import numpy as np
@@ -131,8 +132,12 @@ if _AVAILABLE:
             if capture._callback:
                 try:
                     capture._callback(pcm.reshape(-1, 1), len(pcm), None, None)
-                except Exception:
-                    pass  # absorb sd.CallbackAbort from recording stop signals
+                except Exception as e:
+                    # sounddevice.CallbackAbort is the downstream stop signal; swallow it.
+                    # Log and stop capture for anything else so bugs surface instead of vanishing.
+                    if type(e).__name__ != "CallbackAbort":
+                        sys.stderr.write(f"system_audio callback error: {type(e).__name__}: {e}\n")
+                    capture._stop.set()
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
@@ -172,6 +177,8 @@ class SystemAudioCapture:
         self._ready    = threading.Event()
         self._stop     = threading.Event()
         self._err: "str | None" = None
+        self._stop_lock = threading.Lock()
+        self._stopped   = False
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -188,14 +195,24 @@ class SystemAudioCapture:
             raise RuntimeError(f"ScreenCaptureKit: {self._err}")
 
     def stop(self):
-        """Stop capture and release the SCStream."""
-        self._stop.set()
-        if self._stream:
-            done = threading.Event()
-            self._stream.stopCaptureWithCompletionHandler_(lambda _: done.set())
-            done.wait(timeout=2)  # give SCKit up to 2s to clean up
+        """Stop capture and release the SCStream. Idempotent and thread-safe."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._stop.set()
+            stream = self._stream
             self._stream = None
-        self._delegate = None  # release delegate
+        if stream:
+            done = threading.Event()
+            def _on_stopped(_):
+                # Drop delegate ref only after SCKit confirms no more callbacks.
+                self._delegate = None
+                done.set()
+            stream.stopCaptureWithCompletionHandler_(_on_stopped)
+            if not done.wait(timeout=2):
+                # SCKit did not confirm shutdown — keep delegate alive rather than risk UAF.
+                pass
 
     # ── Internal setup ────────────────────────────────────────────────────────
 
