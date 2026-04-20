@@ -83,6 +83,10 @@ DEFAULT_CONFIG = {
         # False (default): mic = "You" — fastest, correct when alone at desk
         # True: run Sortformer on mic channel too to separate local speakers
         "diarise_mic": False,
+        # Remove acoustic bleed of system audio that leaked into the mic
+        # (speaker-to-mic echo). Scalar-gain canceller with cross-correlation
+        # delay estimate; skips when the estimate is not confidently bleed.
+        "cancel_bleed": True,
     },
 
     # Accepted audio file types for transcription and listing
@@ -1795,7 +1799,63 @@ def _is_stereo(audio_path):
         return False  # assume mono if file can't be read
 
 
-def _split_stereo(audio_path, sr=16000):
+def _cancel_bleed(mic, sys_audio, sr=16000, max_delay_ms=400, est_seconds=60):
+    """Remove system-audio bleed that leaked into the mic channel.
+
+    Scalar-gain canceller: finds the mic-vs-system delay by cross-correlation,
+    estimates a least-squares gain, subtracts α·sys_delayed from mic. Bails out
+    when the estimate is not confidently bleed — simultaneous independent speech
+    in the two channels passes through unchanged.
+    """
+    n = min(len(mic), len(sys_audio))
+    if n < sr:  # < 1s — nothing useful to estimate
+        return mic
+    mic = mic.astype(np.float32, copy=False)
+    sys_audio = sys_audio.astype(np.float32, copy=False)
+    est_n = min(n, est_seconds * sr)
+    max_lag = int(sr * max_delay_ms / 1000)
+    if est_n <= max_lag + sr:  # need a reasonable window after reserving lag space
+        return mic
+    m_win = mic[:est_n]
+    s_win = sys_audio[:est_n - max_lag]
+    if np.sqrt(np.mean(m_win ** 2)) < 1e-4 or np.sqrt(np.mean(s_win ** 2)) < 1e-4:
+        return mic
+    from scipy.signal import correlate
+    xcorr = correlate(m_win, s_win, mode="valid")  # length = max_lag + 1
+    lag = int(np.argmax(np.abs(xcorr)))
+    m_aln = mic[lag:lag + len(s_win)]
+    denom = np.sqrt(np.sum(m_aln ** 2) * np.sum(s_win ** 2))
+    corr = float(np.sum(m_aln * s_win) / denom) if denom > 1e-8 else 0.0
+    if corr < 0.05:
+        _log("bleed", status="skip", reason="no-bleed", corr=f"{corr:.3f}")
+        return mic
+    ss = float(np.sum(s_win * s_win))
+    if ss < 1e-8:
+        return mic
+    alpha = float(np.sum(m_aln * s_win) / ss)
+    if not 0.0 < alpha <= 1.5:
+        _log("bleed", status="skip", reason="implausible-gain",
+             alpha=f"{alpha:.3f}", lag=lag)
+        return mic
+    shifted = np.zeros_like(mic)
+    copy_n = min(len(mic) - lag, len(sys_audio))
+    if copy_n > 0:
+        shifted[lag:lag + copy_n] = sys_audio[:copy_n] * alpha
+    mic_clean = mic - shifted
+    # Residual check: if correlation doesn't drop, the estimate was wrong — revert.
+    mc = mic_clean[lag:lag + len(s_win)]
+    denom2 = np.sqrt(np.sum(mc ** 2) * np.sum(s_win ** 2))
+    corr_after = float(np.sum(mc * s_win) / denom2) if denom2 > 1e-8 else 0.0
+    if abs(corr_after) >= abs(corr):
+        _log("bleed", status="skip", reason="no-improvement",
+             corr=f"{corr:.3f}", after=f"{corr_after:.3f}")
+        return mic
+    _log("bleed", status="cancelled", lag_ms=f"{lag * 1000 / sr:.0f}",
+         alpha=f"{alpha:.3f}", corr_before=f"{corr:.3f}", corr_after=f"{corr_after:.3f}")
+    return mic_clean
+
+
+def _split_stereo(audio_path, sr=16000, cancel_bleed=False):
     """Split a stereo WAV into two mono temp files (mic, system).
 
     Returns (mic_path, sys_path) as temp file paths. Caller must clean up.
@@ -1806,6 +1866,8 @@ def _split_stereo(audio_path, sr=16000):
         return None, None  # mono file
     mic = data[:, 0]
     sys_audio = data[:, 1]
+    if cancel_bleed:
+        mic = _cancel_bleed(mic, sys_audio, sr=file_sr)
     mic_fd, mic_path = tempfile.mkstemp(suffix="_mic.wav")
     sys_fd, sys_path = tempfile.mkstemp(suffix="_sys.wav")
     os.close(mic_fd)
@@ -2327,7 +2389,8 @@ def cmd_run(args):
 
         if is_stereo_input:
             # ── Stereo pipeline: transcribe each channel independently ──
-            mic_path, sys_path = _split_stereo(transcribe_path)
+            cancel_bleed = config["audio"].get("cancel_bleed", True)
+            mic_path, sys_path = _split_stereo(transcribe_path, cancel_bleed=cancel_bleed)
 
             # Normalise each channel independently
             if normalise_enabled:
