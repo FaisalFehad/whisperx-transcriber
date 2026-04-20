@@ -15,33 +15,33 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SHELL_RC="$HOME/.zshrc"
-# Read output paths from config.json if it exists, otherwise use defaults
+# Read output paths from config.json if it exists, otherwise use defaults.
+# Path passed via argv (not interpolated) so SCRIPT_DIR cannot break out of the string.
 DEFAULT_BASE="$HOME/Transcriptions"
+read_cfg() {
+    python3 -c '
+import json, os, sys
+cfg_path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(cfg_path) as f:
+        val = json.load(f).get("paths", {}).get(key, default)
+except Exception:
+    val = default
+print(os.path.expanduser(val))
+' "$1" "$2" "$3" 2>/dev/null
+}
 if [ -f "$SCRIPT_DIR/config.json" ] && command -v python3 &>/dev/null; then
-    CONFIG_BASE=$(python3 -c "
-import json, os
-with open('$SCRIPT_DIR/config.json') as f:
-    c = json.load(f)
-base = c.get('paths', {}).get('base', '$DEFAULT_BASE')
-print(os.path.expanduser(base))
-" 2>/dev/null) || CONFIG_BASE="$DEFAULT_BASE"
+    CONFIG_BASE=$(read_cfg "$SCRIPT_DIR/config.json" "base" "$DEFAULT_BASE") || CONFIG_BASE="$DEFAULT_BASE"
+    [ -z "$CONFIG_BASE" ] && CONFIG_BASE="$DEFAULT_BASE"
+    REC_SUBDIR=$(read_cfg "$SCRIPT_DIR/config.json" "recordings_subdir" "Recordings") || REC_SUBDIR="Recordings"
+    [ -z "$REC_SUBDIR" ] && REC_SUBDIR="Recordings"
+    SCRIPTS_SUBDIR=$(read_cfg "$SCRIPT_DIR/config.json" "scripts_subdir" "Scripts") || SCRIPTS_SUBDIR="Scripts"
+    [ -z "$SCRIPTS_SUBDIR" ] && SCRIPTS_SUBDIR="Scripts"
 else
     CONFIG_BASE="$DEFAULT_BASE"
+    REC_SUBDIR="Recordings"
+    SCRIPTS_SUBDIR="Scripts"
 fi
-REC_SUBDIR=$(python3 -c "
-import json
-try:
-    with open('$SCRIPT_DIR/config.json') as f:
-        print(json.load(f).get('paths', {}).get('recordings_subdir', 'Recordings'))
-except: print('Recordings')
-" 2>/dev/null) || REC_SUBDIR="Recordings"
-SCRIPTS_SUBDIR=$(python3 -c "
-import json
-try:
-    with open('$SCRIPT_DIR/config.json') as f:
-        print(json.load(f).get('paths', {}).get('scripts_subdir', 'Scripts'))
-except: print('Scripts')
-" 2>/dev/null) || SCRIPTS_SUBDIR="Scripts"
 RECORDINGS_DIR="$CONFIG_BASE/$REC_SUBDIR"
 TRANSCRIPTS_DIR="$CONFIG_BASE/$SCRIPTS_SUBDIR"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.transcriber.watch.plist"
