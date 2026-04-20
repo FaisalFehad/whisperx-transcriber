@@ -1132,16 +1132,20 @@ def _mix_audio(mic_frames, sys_frames, dual_mode, normalise=True, mic_switch_poi
         sys_audio = np.concatenate(sys_frames)
         if normalise:
             sys_audio = _normalise(sys_audio)
-        # Pad shorter channel with silence rather than truncate — never drop speech.
+        # Flatten to 1D for column_stack and pad shorter channel with silence
+        # rather than truncating — never drop speech.
+        mic_audio = np.asarray(mic_audio).reshape(-1)
+        sys_audio = np.asarray(sys_audio).reshape(-1)
         max_len = max(len(mic_audio), len(sys_audio))
         if len(mic_audio) < max_len:
-            mic_audio = np.concatenate([mic_audio, np.zeros(max_len - len(mic_audio), dtype=mic_audio.dtype)])
+            mic_audio = np.pad(mic_audio, (0, max_len - len(mic_audio)))
         if len(sys_audio) < max_len:
-            sys_audio = np.concatenate([sys_audio, np.zeros(max_len - len(sys_audio), dtype=sys_audio.dtype)])
+            sys_audio = np.pad(sys_audio, (0, max_len - len(sys_audio)))
         _log("mix", mode="stereo", normalise=normalise, samples=max_len,
              mic_rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}",
              sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
         return np.column_stack([mic_audio, sys_audio])
+    mic_audio = np.asarray(mic_audio).reshape(-1)
     _log("mix", mode="mono", normalise=normalise, samples=len(mic_audio),
          rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}")
     return mic_audio
