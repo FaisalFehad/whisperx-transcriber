@@ -10,6 +10,7 @@ build/
 
 # User data (never commit)
 config.json
+config/
 speakers/
 recordings/
 .checkpoints/
@@ -17,6 +18,8 @@ history.jsonl
 
 # Claude Code context (personal, not shared)
 CLAUDE.md
+.claude/
+.remember/
 
 # Test artifacts
 tests/
@@ -36,3 +39,4 @@ watch-stderr.log
 # IDE
 .vscode/
 .idea/
+.cytoScnpy

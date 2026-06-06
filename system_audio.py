@@ -140,13 +140,6 @@ if _AVAILABLE:
                     capture._stop.set()
 
 
-# ── Public helpers ────────────────────────────────────────────────────────────
-
-def is_available() -> bool:
-    """True if pyobjc-framework-ScreenCaptureKit is installed and importable."""
-    return _AVAILABLE
-
-
 # ── Capture class ─────────────────────────────────────────────────────────────
 
 class SystemAudioCapture:
@@ -221,68 +214,65 @@ class SystemAudioCapture:
         delegate._capture_ref = self
         self._delegate = delegate      # prevent GC
 
-        # ── Step 1: get shareable content (async, GCD callback) ───────────────
         # Use objc.lookUpClass() to bypass the framework's metadict — our
         # registerMetaDataForSelector override is only consulted via lookUpClass.
         _SCShareableContent = objc.lookUpClass("SCShareableContent")
-
-        def on_content(content, error, _):
-            if error:
-                self._err = error.localizedDescription()
-                self._ready.set()
-                return
-
-            if content is None:
-                self._err = "no SCShareableContent returned"
-                self._ready.set()
-                return
-
-            displays = content.displays()
-            if not displays:
-                self._err = "no display found (SCContentFilter requires a display)"
-                self._ready.set()
-                return
-
-            # ── Step 2: configure stream ──────────────────────────────────────
-            filt = _SCKit.SCContentFilter.alloc().initWithDisplay_excludingWindows_(
-                displays[0], []
-            )
-            cfg = _SCKit.SCStreamConfiguration.alloc().init()
-            cfg.setCapturesAudio_(True)
-            cfg.setExcludesCurrentProcessAudio_(True)
-            cfg.setSampleRate_(float(self._rate))
-            cfg.setChannelCount_(1)
-
-            stream = _SCKit.SCStream.alloc().initWithFilter_configuration_delegate_(
-                filt, cfg, None
-            )
-
-            # addStreamOutput:type:sampleHandlerQueue:error:
-            # Framework metadata does NOT mark error: as an out-param,
-            # so we must pass all 4 args explicitly (returns just BOOL).
-            ok = stream.addStreamOutput_type_sampleHandlerQueue_error_(
-                delegate,
-                1,      # SCStreamOutputTypeAudio
-                None,   # sampleHandlerQueue — None uses SCKit's internal queue
-                None,   # error — not an out-param in this framework's metadata
-            )
-            if not ok:
-                self._err = "addStreamOutput failed"
-                self._ready.set()
-                return
-
-            self._stream = stream
-
-            # ── Step 3: start the stream ──────────────────────────────────────
-            def on_started(err):
-                if err is not None and hasattr(err, "localizedDescription"):
-                    self._err = err.localizedDescription()
-                self._ready.set()
-
-            stream.startCaptureWithCompletionHandler_(on_started)
-
-        _SCShareableContent.getShareableContentWithCompletionHandler_(on_content)
+        _SCShareableContent.getShareableContentWithCompletionHandler_(self._on_shareable_content)
 
         # Keep this thread alive until stop() is called.
         # All SCKit callbacks fire on GCD queues — no NSRunLoop needed.
         self._stop.wait()
+
+    def _on_shareable_content(self, content, error, _):
+        """Step 1 callback: get shareable content, then chain into stream config."""
+        if error:
+            self._err = error.localizedDescription()
+            self._ready.set()
+            return
+        if content is None:
+            self._err = "no SCShareableContent returned"
+            self._ready.set()
+            return
+
+        displays = content.displays()
+        if not displays:
+            self._err = "no display found (SCContentFilter requires a display)"
+            self._ready.set()
+            return
+
+        if not self._configure_audio_stream(displays[0]):
+            return
+        self._stream.startCaptureWithCompletionHandler_(self._on_capture_started)
+
+    def _configure_audio_stream(self, display):
+        """Build + wire the SCStream for audio output. Returns False on failure."""
+        filt = _SCKit.SCContentFilter.alloc().initWithDisplay_excludingWindows_(display, [])
+        cfg = _SCKit.SCStreamConfiguration.alloc().init()
+        cfg.setCapturesAudio_(True)
+        cfg.setExcludesCurrentProcessAudio_(True)
+        cfg.setSampleRate_(float(self._rate))
+        cfg.setChannelCount_(1)
+
+        stream = _SCKit.SCStream.alloc().initWithFilter_configuration_delegate_(filt, cfg, None)
+
+        # addStreamOutput:type:sampleHandlerQueue:error:
+        # Framework metadata does NOT mark error: as an out-param,
+        # so we must pass all 4 args explicitly (returns just BOOL).
+        ok = stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            self._delegate,
+            1,      # SCStreamOutputTypeAudio
+            None,   # sampleHandlerQueue — None uses SCKit's internal queue
+            None,   # error — not an out-param in this framework's metadata
+        )
+        if not ok:
+            self._err = "addStreamOutput failed"
+            self._ready.set()
+            return False
+        self._stream = stream
+        return True
+
+    def _on_capture_started(self, err):
+        """Step 3 callback: stream start acknowledged (success or failure)."""
+        if err is not None and hasattr(err, "localizedDescription"):
+            self._err = err.localizedDescription()
+        self._ready.set()
