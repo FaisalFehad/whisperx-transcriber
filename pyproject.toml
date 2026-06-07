@@ -13,13 +13,14 @@ dependencies = [
     "rich>=13.0",
     "psutil>=5.9",
     "pyobjc-framework-ScreenCaptureKit>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=12.0; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
 transcribe = "transcriber:main"
 
 [tool.setuptools]
-py-modules = ["transcriber", "ui", "system_audio"]
+py-modules = ["transcriber", "ui", "system_audio", "voice_mic"]
 
 [build-system]
 requires = ["setuptools>=68"]

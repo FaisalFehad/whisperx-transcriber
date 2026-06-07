@@ -34,6 +34,13 @@ try:
 except ImportError:
     _SystemAudioCapture = None
 
+try:
+    from voice_mic import VPMicCapture
+    _VP_MIC_AVAILABLE = True
+except (ImportError, RuntimeError):
+    VPMicCapture = None  # type: ignore
+    _VP_MIC_AVAILABLE = False
+
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -825,16 +832,22 @@ def _transcribe_audio(audio_path, model_name, language="en", **kwargs):
 
 
 def _setup_audio_devices():
-    """Get audio device info and recording path. Returns (mic_id, mic_name, dual_mode, source_label, output_path) or raises."""
-    mic_id, mic_name = get_default_mic()
-    if mic_id is None:
-        print("  ❌ No microphone found. Check your audio devices: transcribe setup")
-        raise RuntimeError("No microphone found")
+    """Get recording configuration. Returns (mic_name, dual_mode, source_label, output_path) or raises.
+
+    Mic is captured via VoiceProcessingIO (Apple's hardware AEC). No device
+    enumeration is needed — VPIO opens the system's default input directly.
+    System audio is captured via ScreenCaptureKit.
+    """
+    if not _VP_MIC_AVAILABLE:
+        print("  ❌ VoiceProcessingIO not available.")
+        print("     Install: pip install pyobjc-framework-AVFoundation")
+        raise RuntimeError("VoiceProcessingIO not available")
+    mic_name = "Mac mic (VPIO + AEC)"
     dual_mode = _SystemAudioCapture is not None
     source_label = f"System + {mic_name}" if dual_mode else mic_name
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_path = _unique_path(RECORDINGS_DIR / f"{timestamp}.wav")
-    return mic_id, mic_name, dual_mode, source_label, output_path
+    return mic_name, dual_mode, source_label, output_path
 
 
 def _save_transcript(result, audio_path, title, model_name, language,
@@ -919,73 +932,67 @@ def get_default_mic():
 
 def cmd_setup(args):
     """Check audio setup status."""
-    import sounddevice as sd
-
-    mic_id, mic_name = get_default_mic()
     sck_status = "✅ ScreenCaptureKit (system audio)" if _SystemAudioCapture is not None else "❌ pip install pyobjc-framework-ScreenCaptureKit"
+    vp_status = "✅ VoiceProcessingIO (mic + hardware AEC)" if _VP_MIC_AVAILABLE else "❌ pip install pyobjc-framework-AVFoundation"
 
     from ui import info_panel
     print()
     info_panel("🔧 Audio Setup", [
         ("System:", sck_status),
-        ("Mic:", mic_name),
+        ("Mic:", vp_status),
     ])
 
-    if _SystemAudioCapture is not None:
+    if _SystemAudioCapture is not None and _VP_MIC_AVAILABLE:
         print()
-        print("  ✅ Ready! System audio is captured via ScreenCaptureKit.")
+        print("  ✅ Ready! Mic captured via VoiceProcessingIO (hardware AEC).")
+        print("     System audio captured via ScreenCaptureKit.")
         print("     No virtual audio drivers needed.")
         print("     Volume keys work normally.")
     else:
         print()
-        print("  ⚠  System audio not available. Only mic will be recorded.")
-        print("     To capture Zoom/Teams audio:")
-        print("     pip install pyobjc-framework-ScreenCaptureKit")
+        if not _VP_MIC_AVAILABLE:
+            print("  ⚠  VoiceProcessingIO not available.")
+            print("     pip install pyobjc-framework-AVFoundation")
+        if not _SystemAudioCapture:
+            print("  ⚠  System audio not available. Only mic will be recorded.")
+            print("     pip install pyobjc-framework-ScreenCaptureKit")
 
-    print()
-    print("  Input devices:")
-    found_devices = False
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0:
-            found_devices = True
-            markers = []
-            if i == mic_id:
-                markers.append("active mic")
-            tag = f" ← {', '.join(markers)}" if markers else ""
-            print(f"    [{i}] {d['name']} ({d['max_input_channels']}ch){tag}")
-    if not found_devices:
-        print("    ❌ No input devices found. Check that a mic is connected.")
     print()
 
 
 # ─── Recording ────────────────────────────────────────────────────────────────
 
-def _mic_silence_callback(indata, _frames, _time, _status, *, state):
-    """sounddevice callback for the mic channel — accumulates frames + tracks silence."""
-    import sounddevice as sd
-    if not state["recording"]:
-        raise sd.CallbackAbort()
-    if state["paused"]:
-        return
-    mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
-    with state["lock"]:
-        state["mic_frames"].append(mono.copy())
-        state["current_mic_rms"] = float(np.sqrt(np.mean(mono ** 2)))
-        if state["current_mic_rms"] < SILENCE_THRESHOLD:
-            if state["silence_start"] is None:
-                state["silence_start"] = time.time()
-            elif time.time() - state["silence_start"] >= SILENCE_TIMEOUT:
-                state["recording"] = False
-                raise sd.CallbackAbort()
+def _poll_mic_frame(vp_capture):
+    """Pull one (or more) frames from VPMicCapture, append to state['mic_frames'], update RMS.
+
+    Returns True if recording should continue, False to signal stop.
+    """
+    chunk, _overflow = vp_capture.read_chunk(timeout=0.1)
+    if chunk is None or len(chunk) == 0:
+        return True
+    mono2d = chunk.reshape(-1, 1).astype(np.float32)
+    state_ref = vp_capture._state_ref
+    if state_ref["paused"]:
+        return True
+    with state_ref["lock"]:
+        state_ref["mic_frames"].append(mono2d)
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        state_ref["current_mic_rms"] = rms
+        if rms < SILENCE_THRESHOLD:
+            if state_ref["silence_start"] is None:
+                state_ref["silence_start"] = time.time()
+            elif time.time() - state_ref["silence_start"] >= SILENCE_TIMEOUT:
+                state_ref["recording"] = False
+                return False
         else:
-            state["silence_start"] = None
+            state_ref["silence_start"] = None
+    return True
 
 
 def _sys_silence_callback(indata, _frames, _time, _status, *, state):
-    """sounddevice callback for the system channel — only resets silence timer."""
-    import sounddevice as sd
+    """sounddevice/SCK callback for the system channel — fills sys_frames + resets silence timer."""
     if not state["recording"]:
-        raise sd.CallbackAbort()
+        return
     if state["paused"]:
         return
     mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
@@ -1027,8 +1034,11 @@ def _maybe_system_health_warning(last_check, current_warning):
     return time.time(), current_warning
 
 
-def _run_recording_loop(state, mic_stream, current_mic_id, mic_monitor, display, dual_mode, create_stream):
-    """Main display/keyboard loop. Returns True if the loop ended normally (auto-stop)."""
+def _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode):
+    """Main display/keyboard loop. Polls VPMicCapture and SCK, drives silence detection.
+
+    Returns True if the loop ended normally (auto-stop).
+    """
     from ui import raw_keys, poll_key
     last_health_check = 0
     mic_low_since_rec = None
@@ -1038,6 +1048,14 @@ def _run_recording_loop(state, mic_stream, current_mic_id, mic_monitor, display,
             state["paused"] = paused
             if paused:
                 state["silence_start"] = None
+
+            # Poll mic (VPIO)
+            vp_capture._state_ref = state
+            if not _poll_mic_frame(vp_capture):
+                state["recording"] = False
+                break
+
+            # System audio is filled by SCK's callback (see cmd_record / cmd_live).
 
             with state["lock"]:
                 mic_rms = state["current_mic_rms"]
@@ -1051,18 +1069,10 @@ def _run_recording_loop(state, mic_stream, current_mic_id, mic_monitor, display,
             mic_low_warn, mic_low_since_rec = _mic_low_warning(mic_rms, paused, mic_low_since_rec)
             last_health_check, warning = _maybe_system_health_warning(last_health_check, mic_low_warn)
 
-            mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
-                mic_stream, current_mic_id, create_stream, paused=paused)
-            if switched:
-                with state["lock"]:
-                    state["mic_switch_frames"].append(len(state["mic_frames"]))
-                warning = f"Switched to {new_name}"
-            display.set_warning(warning)
-
             display.update(rms, elapsed, silence_elapsed, paused=paused,
                            mic_rms=mic_rms if dual_mode else None,
                            sys_rms=sys_rms_val if dual_mode else None)
-            time.sleep(0.25)
+            time.sleep(0.1)
     return True
 
 
@@ -1086,7 +1096,7 @@ def cmd_record(args):
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        mic_id, _mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+        _mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
     except RuntimeError:
         return
 
@@ -1112,17 +1122,10 @@ def cmd_record(args):
         "mic_switch_frames": [],
     }
 
-    def mic_callback(indata, frames, time_info, status):
-        _mic_silence_callback(indata, frames, time_info, status, state=state)
+    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE)
 
     def sys_callback(indata, frames, time_info, status):
         _sys_silence_callback(indata, frames, time_info, status, state=state)
-
-    blocksize = int(SAMPLE_RATE * 0.5)
-    current_mic_id = mic_id
-    mic_monitor = MicMonitor()
-    create_stream = lambda dev_id: _make_mic_stream(dev_id, blocksize, mic_callback)
-    mic_stream = create_stream(mic_id)
 
     sck_capture = None
     if _SystemAudioCapture is not None:
@@ -1136,17 +1139,19 @@ def cmd_record(args):
     auto_stopped = False
     display = RecordingDisplay()
     try:
-        mic_stream.start()
+        vp_capture._state_ref = state
+        vp_capture.start()
         if sck_capture:
             sck_capture.start()
-        _run_recording_loop(state, mic_stream, current_mic_id, mic_monitor, display,
-                            dual_mode, create_stream)
+        _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode)
         auto_stopped = True
     except KeyboardInterrupt:
         state["recording"] = False
     finally:
-        mic_stream.stop()
-        mic_stream.close()
+        try:
+            vp_capture.stop()
+        except Exception:
+            pass
         if sck_capture:
             sck_capture.stop()
     elapsed = time.time() - state["start_time"]
@@ -1517,7 +1522,7 @@ def _maybe_mic_low_warning(m_rms, mic_low_since):
     return "", mic_low_since
 
 
-def _run_live_display_loop(state, mic_stream, current_mic_id, mic_monitor, dual_mode, create_stream):
+def _run_live_display_loop(state, dual_mode):
     """UI / keyboard / display loop for live recording. Mutates state['mic_low_since']."""
     last_adaptive_msg = ""
     while state["recording"]:
@@ -1532,11 +1537,6 @@ def _run_live_display_loop(state, mic_stream, current_mic_id, mic_monitor, dual_
 
         mic_warn, state["mic_low_since"] = _maybe_mic_low_warning(
             m_rms, state["mic_low_since"])
-
-        mic_stream, current_mic_id, new_name, switched = mic_monitor.check_and_switch(
-            mic_stream, current_mic_id, create_stream)
-        if switched:
-            mic_warn = f" Switched to {new_name}"
 
         status_line = _build_live_status_line(
             rms, m_rms, b_rms, dual_mode, elapsed,
@@ -1579,15 +1579,14 @@ def _post_process_stereo(audio_data, output_path, model_name, language, live_cfg
 
 
 def _stereo_full_transcribe(stereo_tmp, model_name, language):
-    """Transcribe a full stereo file by splitting into mic+sys and merging."""
+    """Transcribe a full stereo file by splitting into mic+sys and interleaving."""
     remaining_segments = []
     print("  ⏳ Transcribing full recording (stereo)...")
     mic_tmp, sys_tmp = _split_stereo(stereo_tmp)
     try:
-        bleed_metrics = _estimate_bleed_dominance(mic_tmp, sys_tmp)
         mic_r = _transcribe_audio(mic_tmp, model_name, language)
         sys_r = _transcribe_audio(sys_tmp, model_name, language)
-        merged = _merge_transcripts(mic_r, sys_r, bleed_metrics)
+        merged = _interleave_by_timestamp(mic_r, sys_r)
         remaining_segments = merged.get("segments", [])
     except Exception as e:
         print(f"  ⚠  Transcription failed: {e}")
@@ -1598,11 +1597,7 @@ def _stereo_full_transcribe(stereo_tmp, model_name, language):
 
 def _stereo_tail_transcribe(audio_data, last_transcribed_sample, overlap_seconds,
                             model_name, language, *, base_segments):
-    """Transcribe the final overlapping tail as a stereo pair and merge.
-
-    Bleed is estimated on the chunk being processed so the thresholds reflect
-    the current state of the meeting, not the whole recording.
-    """
+    """Transcribe the final overlapping tail as a stereo pair and interleave."""
     remaining = len(audio_data) - last_transcribed_sample
     remaining_duration = remaining / SAMPLE_RATE
     print(f"  ⏳ Transcribing final {format_duration(remaining_duration)} (stereo)...")
@@ -1612,12 +1607,11 @@ def _stereo_tail_transcribe(audio_data, last_transcribed_sample, overlap_seconds
     sys_chunk = audio_data[:, 1][chunk_start:]
     offset = chunk_start / SAMPLE_RATE
     try:
-        bleed_metrics = _estimate_bleed_dominance(mic_chunk, sys_chunk)
         mic_r = _transcribe_chunk(mic_chunk, model_name, language)
         sys_r = _transcribe_chunk(sys_chunk, model_name, language)
         _shift_segments(mic_r.get("segments", []), offset)
         _shift_segments(sys_r.get("segments", []), offset)
-        merged = _merge_transcripts(mic_r, sys_r, bleed_metrics)
+        merged = _interleave_by_timestamp(mic_r, sys_r)
         base_segments.extend(merged.get("segments", []))
     except Exception as e:
         print(f"  ⚠  Final chunk failed: {e}")
@@ -1799,25 +1793,57 @@ def _print_stop_summary(auto_stopped, elapsed, rec_only, chunks_done):
         print(f"  📊 {chunks_done} chunks pre-transcribed during recording")
 
 
-def _run_live_session(mic_stream, sck_capture, transcription_thread, state, mic_monitor, current_mic_id, dual_mode, create_stream):
-    """Start streams, run the display loop until silence/timeout, then teardown.
+def _live_mic_poll_thread(vp_capture, state, stop_event):
+    """Dedicated thread: poll VPMicCapture chunks and append to state['mic_frames'].
+
+    This replaces the sounddevice callback that used to fill mic_frames during
+    live mode. Runs until stop_event is set or recording state goes False.
+    """
+    vp_capture._state_ref = state
+    while not stop_event.is_set() and state["recording"]:
+        chunk, _overflow = vp_capture.read_chunk(timeout=0.1)
+        if chunk is None or len(chunk) == 0:
+            continue
+        if state["paused"]:
+            continue
+        mono2d = chunk.reshape(-1, 1).astype(np.float32)
+        with state["lock"]:
+            state["mic_frames"].append(mono2d)
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            state["mic_rms_val"] = rms
+            state["current_rms"] = max(state["current_rms"], rms)
+            if rms < SILENCE_THRESHOLD:
+                if state["silence_start"] is None:
+                    state["silence_start"] = time.time()
+                elif time.time() - state["silence_start"] >= SILENCE_TIMEOUT:
+                    state["recording"] = False
+                    return
+            else:
+                state["silence_start"] = None
+
+
+def _run_live_session(vp_capture, sck_capture, transcription_thread, mic_poll_thread,
+                     state, dual_mode):
+    """Start VPIO, SCK, transcription + mic poll threads; run the display loop.
 
     Returns True if the loop ended normally (auto-stop), False if user hit Ctrl-C.
     """
     auto_stopped = False
     try:
-        mic_stream.start()
+        vp_capture.start()
         if sck_capture:
             sck_capture.start()
         transcription_thread.start()
-        _run_live_display_loop(state, mic_stream, current_mic_id, mic_monitor,
-                               dual_mode, create_stream)
+        mic_poll_thread.start()
+        _run_live_display_loop(state, dual_mode)
         auto_stopped = True
     except KeyboardInterrupt:
         state["recording"] = False
     finally:
-        mic_stream.stop()
-        mic_stream.close()
+        try:
+            vp_capture.stop()
+        except Exception:
+            pass
         if sck_capture:
             sck_capture.stop()
     return auto_stopped
@@ -1831,19 +1857,14 @@ def _drain_transcription_thread(stop_event, chunk_in_progress, thread, timeout=1
     thread.join(timeout=timeout)
 
 
-def _setup_live_recording(state, model_name, language, mic_id, dual_mode, mic_callback, sys_callback, get_snapshot):
-    """Create mic stream, system capture, mic monitor, and the transcription thread.
+def _setup_live_recording(state, model_name, language, dual_mode, get_snapshot):
+    """Create VPIO capture, system capture, transcription thread + mic poll thread.
 
-    Returns (RecordingSetup) namedtuple-like dict: mic_stream, sck_capture, dual_mode,
-    current_mic_id, mic_monitor, create_stream, transcription_thread, transcribed_segments,
-    transcribe_lock, stop_event, live_cfg, adaptive.
+    Returns dict: vp_capture, sck_capture, dual_mode, transcription_thread,
+    mic_poll_thread, transcribed_segments, transcribe_lock, stop_event,
+    live_cfg, adaptive.
     """
-    blocksize = int(SAMPLE_RATE * 0.5)
-    current_mic_id = mic_id
-    mic_monitor = MicMonitor()
-    create_stream = lambda dev_id: _make_mic_stream(dev_id, blocksize, mic_callback)
-    mic_stream = create_stream(mic_id)
-    sck_capture, sck_error = _open_sys_capture(sys_callback)
+    sck_capture, sck_error = _open_sys_capture(sys_callback=None)
     if sck_error:
         print(f"  ⚠  System audio unavailable: {sck_error}")
         dual_mode = False
@@ -1860,10 +1881,17 @@ def _setup_live_recording(state, model_name, language, mic_id, dual_mode, mic_ca
               transcribe_lock, transcribed_segments, get_snapshot),
         daemon=True,
     )
+
+    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE)
+    mic_poll_thread = threading.Thread(
+        target=_live_mic_poll_thread,
+        args=(vp_capture, state, stop_event),
+        daemon=True,
+    )
+
     return {
-        "mic_stream": mic_stream, "sck_capture": sck_capture, "dual_mode": dual_mode,
-        "current_mic_id": current_mic_id, "mic_monitor": mic_monitor,
-        "create_stream": create_stream, "transcription_thread": transcription_thread,
+        "vp_capture": vp_capture, "sck_capture": sck_capture, "dual_mode": dual_mode,
+        "transcription_thread": transcription_thread, "mic_poll_thread": mic_poll_thread,
         "transcribed_segments": transcribed_segments, "transcribe_lock": transcribe_lock,
         "stop_event": stop_event, "live_cfg": live_cfg, "adaptive": adaptive,
     }
@@ -1911,26 +1939,19 @@ def cmd_live(args):
         return
 
     try:
-        mic_id, _mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
+        _mic_name, dual_mode, source_label, output_path = _setup_audio_devices()
     except RuntimeError:
         return
 
     _print_live_intro(source_label, chunk_interval)
     state = _build_live_state(chunk_interval)
 
-    def mic_callback(indata, frames, time_info, status):
-        _mic_live_callback(indata, frames, time_info, status, state=state)
-
-    def sys_callback(indata, frames, time_info, status):
-        _sys_live_callback(indata, frames, time_info, status, state=state)
-
     def get_snapshot():
         return _get_mixed_snapshot(state["lock"], state["mic_frames"],
                                    state["sys_frames"], dual_mode)
 
     setup = _setup_live_recording(
-        state, model_name, language, mic_id, dual_mode,
-        mic_callback, sys_callback, get_snapshot,
+        state, model_name, language, dual_mode, get_snapshot,
     )
     dual_mode = setup["dual_mode"]
     transcribed_segments = setup["transcribed_segments"]
@@ -1940,14 +1961,15 @@ def cmd_live(args):
     adaptive = setup["adaptive"]
 
     auto_stopped = _run_live_session(
-        setup["mic_stream"], setup["sck_capture"], setup["transcription_thread"], state,
-        setup["mic_monitor"], setup["current_mic_id"], dual_mode, setup["create_stream"])
+        setup["vp_capture"], setup["sck_capture"], setup["transcription_thread"],
+        setup["mic_poll_thread"], state, dual_mode)
 
     clear_line()
     recording_end = time.time()
     elapsed = recording_end - state["start_time"]
 
     _drain_transcription_thread(stop_event, state["chunk_in_progress"], setup["transcription_thread"])
+    setup["mic_poll_thread"].join(timeout=2)
 
     if not state["mic_frames"]:
         print("  ⚠  No audio recorded.")
@@ -2409,60 +2431,26 @@ def _build_dedup_thresholds(audio_cfg, bleed_metrics):
     }
 
 
-def _merge_transcripts(mic_result, sys_result, bleed_metrics=None):
-    """Merge two transcripts (mic + system) by timestamp into one result.
+def _interleave_by_timestamp(mic_result, sys_result):
+    """Combine mic + system transcripts by timestamp.
+
+    With VoiceProcessingIO AEC at the audio layer, the mic channel has no
+    system-audio bleed by the time it reaches ASR, so transcript-level
+    dedup is no longer needed. We just sort all segments by start time,
+    stamp each with its source channel for display, and return.
 
     Both inputs should already have speaker labels assigned.
-
-    Implements transcript-level echo suppression via a 3-tier rule:
-    • True duplicate  (similarity OR containment above suppress thresholds) → drop mic segment
-    • Weak duplicate  (similarity OR containment above weak thresholds) → keep, mark status
-    • Otherwise       → keep both (independent speech or true crosstalk)
-
-    Each mic segment is compared against the UNION of all overlapping system
-    segments (concatenated text), so a single mic echo that spans multiple
-    system ASR segments is matched against the full reference.
-    Text is normalized (lowercase, punctuation stripped, whitespace collapsed)
-    before scoring.
-
-    Thresholds are derived from audio.dedup_* config keys, scaled continuously
-    by the per-file bleed score (0=no bleed → use _max; 1=saturated → use _min)
-    when audio.dedup_aggressiveness is "auto". "conservative" forces _max,
-    "aggressive" forces _min.
-
-    System segments are treated as authoritative only when their confidence
-    is ≥ the competing mic segment's confidence (if confidence keys exist).
-    See CLAUDE.md Caveat 1 & 2 — this is NOT true acoustic echo cancellation.
     """
     mic_segs = mic_result.get("segments", [])
     sys_segs = sys_result.get("segments", [])
-
-    _tag_source_channel(sys_segs, "system")
-    _tag_source_channel(mic_segs, "mic")
-
-    thresholds = _build_dedup_thresholds(config["audio"], bleed_metrics)
-
-    sys_by_time = sorted(sys_segs, key=lambda s: s.get("start", 0))
-    counters = {"suppressed": 0, "weak": 0}
-    kept_mic = [seg for seg in mic_segs
-                if _dedup_mic_segment(seg, sys_by_time, counters, thresholds=thresholds)]
-
-    final_segments = sorted(sys_segs + kept_mic, key=lambda s: s.get("start", 0))
-    overlaps = _count_crosstalk(final_segments)
-
-    bm = bleed_metrics or {}
-    _log("merge", mic_segs=len(mic_segs), sys_segs=len(sys_segs),
-         kept=len(kept_mic), suppressed=counters["suppressed"], weak=counters["weak"],
-         total=len(final_segments), overlaps=overlaps,
-         bleed_score=f"{bm.get('score', 0.0):.3f}",
-         bleed_ratio=f"{bm.get('ratio', 0.0):.3f}",
-         bleed_r2=f"{bm.get('r2', 0.0):.3f}",
-         bleed_dur=f"{bm.get('duration', 0.0):.1f}s",
-         sim_t=f"{thresholds['suppress_similarity']:.2f}",
-         ov_t=f"{thresholds['suppress_overlap']:.2f}")
-
+    for seg in mic_segs:
+        seg["_source_channel"] = "mic"
+    for seg in sys_segs:
+        seg["_source_channel"] = "system"
+    final = sorted(mic_segs + sys_segs, key=lambda s: s.get("start", 0))
+    _log("interleave", mic_segs=len(mic_segs), sys_segs=len(sys_segs), total=len(final))
     return {
-        "segments": final_segments,
+        "segments": final,
         "language": mic_result.get("language", sys_result.get("language", "en")),
     }
 
@@ -2909,18 +2897,22 @@ def _run_normalise_step(transcribe_path, is_stereo, normalise_enabled):
     return tmp_path
 
 
-def _diarise_stereo_channels(mic_path, sys_path, diarise_enabled, diarise_mic, progress, step):
-    """Diarise both stereo channels (system always, mic when configured)."""
+def _diarise_stereo_channels(mic_path, sys_path, diarise_enabled, progress, step):
+    """Diarise both stereo channels (system + mic).
+
+    With VPIO at the recording layer, the mic channel is now clean enough to
+    always diarise — there's no reason to skip it. The pre-VPIO `diarise_mic`
+    config flag was a workaround for when mic contained system bleed that
+    confused Sortformer.
+    """
     if not diarise_enabled:
         return None, None, step
     import mlx.core as mx
     progress.set_step(step)
     sys_turns = _diarise_standalone(sys_path)
-    mic_turns = None
-    if diarise_mic:
-        gc.collect()
-        mx.clear_cache()
-        mic_turns = _diarise_standalone(mic_path)
+    gc.collect()
+    mx.clear_cache()
+    mic_turns = _diarise_standalone(mic_path)
     gc.collect()
     mx.clear_cache()
     return sys_turns, mic_turns, step + 1
@@ -2956,24 +2948,27 @@ def _normalise_stereo_channels(mic_path, sys_path):
 
 
 def _run_stereo_pipeline(transcribe_path, model_name, language, normalise_enabled,
-                         diarise_enabled, diarise_mic, progress, step):
-    """Run the per-channel stereo ASR pipeline + speaker labels + merge."""
+                         diarise_enabled, progress, step):
+    """Run the per-channel stereo ASR pipeline + speaker labels + interleave.
+
+    No echo dedup — VPIO at the recording layer has already removed system
+    bleed from the mic channel, so transcript-level dedup would be a no-op.
+    """
     import mlx.core as mx
     mic_path, sys_path = _split_stereo(transcribe_path)
     if normalise_enabled:
         _normalise_stereo_channels(mic_path, sys_path)
     try:
         sys_turns, mic_turns, step = _diarise_stereo_channels(
-            mic_path, sys_path, diarise_enabled, diarise_mic, progress, step)
+            mic_path, sys_path, diarise_enabled, progress, step)
         progress.set_step(step)
-        bleed_metrics = _estimate_bleed_dominance(mic_path, sys_path)
         mic_result = _transcribe_audio(mic_path, model_name, language)
         gc.collect()
         mx.clear_cache()
         sys_result = _transcribe_audio(sys_path, model_name, language)
         _label_sys_segments(sys_result, sys_turns)
         _label_mic_segments(mic_result, mic_turns)
-        return _merge_transcripts(mic_result, sys_result, bleed_metrics), step + 1
+        return _interleave_by_timestamp(mic_result, sys_result), step + 1
     finally:
         _cleanup_temp_files(mic_path, sys_path)
 
@@ -3145,7 +3140,7 @@ def _execute_pipeline(opts, progress, step):
         result, step = _run_stereo_pipeline(
             transcribe_path, opts["model_name"], opts["language"],
             opts["normalise_enabled"], opts["diarise_enabled"],
-            config["audio"]["diarise_mic"], progress, step)
+            progress, step)
     else:
         result, step = _run_mono_pipeline(
             transcribe_path, opts["model_name"], opts["language"],
