@@ -1,9 +1,8 @@
 """Microphone capture via Apple's VoiceProcessingIO AudioUnit (macOS 10.14+).
 
-Replaces sounddevice InputStream for the mic channel. Voice processing performs
-hardware acoustic echo cancellation at the audio layer — the captured stream
-has system playback bleed removed before it leaves the unit, so downstream code
-no longer needs transcript-level dedup.
+Voice processing performs hardware acoustic echo cancellation at the audio
+layer — the captured stream has system playback bleed removed before it
+leaves the unit, so downstream code no longer needs transcript-level dedup.
 
 Uses AVAudioEngine.installTap with setVoiceProcessingEnabled. Apple's official
 high-level API; the alternative (ctypes + AudioUnitRender + render-notify
@@ -26,24 +25,29 @@ import numpy as np
 
 try:
     import AVFoundation
-    import objc
     _AVAILABLE = True
 except ImportError:
     _AVAILABLE = False
 
 
-# Target sample rate the rest of the pipeline expects. The AVAudioEngine tap
-# delivers at the hardware's preferred rate (~24 kHz on Mac built-in mic);
-# we resample to this rate on a background thread so callers always see 16 kHz.
+# Float32 item size — what VPIO hands us per channel sample.
+_F32_BYTES = np.dtype(np.float32).itemsize
+
+# Default sample rate the rest of the pipeline expects. The AVAudioEngine tap
+# delivers at the hardware's preferred rate (24 or 48 kHz on Mac); we
+# resample to this rate on the audio thread so callers always see 16 kHz.
 _DEFAULT_TARGET_RATE = 16000
+
+# Tap buffer size in frames. 4096 at 24 kHz ≈ 170 ms — small enough for
+# responsive display, big enough to keep the audio thread at ~6 callbacks/sec.
+_TAP_BUFFER_FRAMES = 4096
 
 
 class VPMicCapture:
     """AVAudioEngine-based mic capture with hardware acoustic echo cancellation.
 
-    The callback signature matches sounddevice.InputStream for drop-in use:
-        callback(indata: np.ndarray, frames: int, time, status)
-        indata shape: (N, 1), dtype float32, sample_rate=16000.
+    Producer-only: the tap callback fills an internal queue, callers drain
+    via `read_chunk()` or `drain()`. No external state coupling.
 
     Usage
     -----
@@ -65,18 +69,18 @@ class VPMicCapture:
         self._callback = callback
 
         self._engine = None
-        self._input_node: "AVFoundation.AVAudioInputNode | None" = None
+        self._input_node: Optional["AVFoundation.AVAudioInputNode"] = None
         self._tap_bus = 0
         self._source_rate = 0
 
-        # Resampled (16 kHz) mono frames, ready for the rest of the pipeline.
+        # Resampled (target_rate Hz) mono frames, ready for the rest of the
+        # pipeline. Lock protects the list + the optional callback reference.
         self._frames: List[np.ndarray] = []
-        self._frames_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._overflow = 0
 
         self._started = False
         self._stopped = False
-        self._overflow = 0
-        self._err: "str | None" = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -88,11 +92,13 @@ class VPMicCapture:
         self._input_node = self._engine.inputNode()
 
         # Enable Apple's hardware acoustic echo cancellation. This is the entire
-        # reason this module exists — without it, mic picks up the speakers'
+        # reason this module exists — without it, the mic picks up speaker
         # playback and ASR transcribes both.
         ok, err = self._input_node.setVoiceProcessingEnabled_error_(True, None)
         if not ok:
             err_str = err.localizedDescription() if err is not None else "unknown"
+            self._engine = None
+            self._input_node = None
             raise RuntimeError(f"setVoiceProcessingEnabled failed: {err_str}")
 
         # Tap on the input bus. Apple's VPIO returns 3 channels:
@@ -102,19 +108,19 @@ class VPMicCapture:
         # We extract ch0 in the tap callback.
         fmt = self._input_node.outputFormatForBus_(self._tap_bus)
         if fmt is None:
+            self._engine = None
+            self._input_node = None
             raise RuntimeError("inputNode.outputFormatForBus returned nil")
         self._source_rate = int(fmt.sampleRate())
 
         self._input_node.installTapOnBus_bufferSize_format_block_(
-            self._tap_bus,
-            4096,           # 4096-frame buffers (~170 ms at 24 kHz)
-            fmt,
-            self._tap_block,
+            self._tap_bus, _TAP_BUFFER_FRAMES, fmt, self._tap_block,
         )
 
         self._engine.prepare()
         ok, err = self._engine.startAndReturnError_(None)
         if not ok:
+            self._stop()  # teardown partial state
             err_str = err.localizedDescription() if err is not None else "unknown"
             raise RuntimeError(f"AVAudioEngine.start failed: {err_str}")
         self._started = True
@@ -125,6 +131,57 @@ class VPMicCapture:
         if self._stopped:
             return
         self._stopped = True
+        self._stop()
+
+    def read_chunk(self, timeout: float = 0.1):
+        """Return the next buffered block of 16 kHz mono audio.
+
+        Returns (frames, overflow). frames has shape (N,). Returns (None, False)
+        on timeout. May return short frames.
+        """
+        if not self._started:
+            raise RuntimeError("VPMicCapture not started — call start() first")
+        deadline = time.time() + timeout
+        with self._lock:
+            if self._frames:
+                return self._frames.pop(0), False
+        remaining = max(0.0, deadline - time.time())
+        if remaining > 0:
+            time.sleep(remaining)
+        with self._lock:
+            if self._frames:
+                return self._frames.pop(0), False
+        return None, False
+
+    def drain(self) -> np.ndarray:
+        """Drain all buffered frames and return as a single 1-D array."""
+        with self._lock:
+            if not self._frames:
+                return np.zeros(0, dtype=np.float32)
+            out = np.concatenate(self._frames).astype(np.float32)
+            self._frames.clear()
+            return out
+
+    @property
+    def overflow(self) -> int:
+        return self._overflow
+
+    @property
+    def source_rate(self) -> int:
+        """Hardware rate the tap delivers at (0 before start())."""
+        return self._source_rate
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _stop(self) -> None:
+        """Internal teardown — assumes `stopped` is already being set."""
         if self._input_node is not None:
             try:
                 self._input_node.removeTapOnBus_(self._tap_bus)
@@ -138,56 +195,12 @@ class VPMicCapture:
         self._engine = None
         self._input_node = None
 
-    def read_chunk(self, timeout: float = 0.1):
-        """Return the next buffered block of 16 kHz mono audio.
-
-        Returns (frames, overflow). frames has shape (N,). Returns (None, False)
-        on timeout. May return short frames.
-        """
-        if not self._started:
-            raise RuntimeError("VPMicCapture not started — call start() first")
-        deadline = time.time() + timeout
-        with self._frames_lock:
-            if self._frames:
-                chunk = self._frames.pop(0)
-                return chunk, False
-        remaining = max(0.0, deadline - time.time())
-        if remaining > 0:
-            time.sleep(remaining)
-        with self._frames_lock:
-            if self._frames:
-                chunk = self._frames.pop(0)
-                return chunk, False
-        return None, False
-
-    def drain(self) -> np.ndarray:
-        """Drain all buffered frames and return as a single 1-D array."""
-        with self._frames_lock:
-            if not self._frames:
-                return np.zeros(0, dtype=np.float32)
-            out = np.concatenate(self._frames).astype(np.float32)
-            self._frames.clear()
-            return out
-
-    @property
-    def overflow(self) -> int:
-        return self._overflow
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, *_):
-        self.stop()
-
-    # ── Internal: tap callback (block) ────────────────────────────────────────
-
     def _tap_block(self, buf, when):
         """Block called by AVAudioEngine on a real-time audio thread.
 
-        We extract channel 0 (the AEC-processed mic), resample to target rate,
-        and hand off to the consumer via the callback or the read buffer.
-        No blocking work is done here.
+        Extracts channel 0 (the AEC-processed mic), downsamples to the target
+        rate, and hands it to the consumer queue. No blocking work happens
+        here.
         """
         try:
             if buf is None:
@@ -196,32 +209,31 @@ class VPMicCapture:
             if frame_count <= 0:
                 return
 
-            # floatChannelData gives us per-channel float32 buffers. VPIO
-            # delivers 3 channels: [0] AEC-processed, [1] raw, [2] reference.
-            # We want [0].
-            data_ptrs = buf.floatChannelData()
-            ch0 = data_ptrs[0]
-            # ch0 is a PyObjC "varlist" wrapping an UnsafePointer<Float>.
-            # as_buffer(n_bytes) gives a memoryview of the first n_bytes —
-            # which is exactly frame_count × sizeof(Float32).
+            # floatChannelData returns a tuple of "varlist" objects wrapping
+            # UnsafePointer<Float>. Channel 0 is the AEC-cleaned mic.
+            # as_buffer(n_bytes) gives a memoryview of the first n_bytes.
+            ch0 = buf.floatChannelData()[0]
             raw = np.frombuffer(
-                ch0.as_buffer(frame_count * 4),
+                ch0.as_buffer(frame_count * _F32_BYTES),
                 dtype=np.float32,
                 count=frame_count,
             ).copy()
 
-            # Resample source rate → 16 kHz.
             if self._source_rate != self._target_rate:
                 out = _linear_resample(raw, self._source_rate, self._target_rate)
             else:
-                out = raw.astype(np.float32, copy=True)
+                out = raw
 
-            with self._frames_lock:
+            callback = self._callback
+            with self._lock:
                 self._frames.append(out)
+                if len(self._frames) > 200:  # >2s of buffered 16kHz audio
+                    self._overflow += 1
+                    self._frames.pop(0)
 
-            if self._callback is not None:
+            if callback is not None:
                 try:
-                    self._callback(out.reshape(-1, 1), out.shape[0], None, None)
+                    callback(out.reshape(-1, 1), out.shape[0], None, None)
                 except Exception as e:
                     # Callback runs in audio thread — never let user code crash us.
                     sys.stderr.write(f"vp-mic callback error: {e}\n")
@@ -234,9 +246,9 @@ class VPMicCapture:
 def _linear_resample(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     """Linear-interpolation resample (mono float32).
 
-    AVAudioEngine's VPIO has already bandlimited the output to voice frequencies
-    (≤8 kHz) — we're just re-spacing the samples. Linear interpolation is
-    audibly transparent at this stage and ~10× cheaper than polyphase.
+    VPIO has already low-passed the signal at the source rate's Nyquist
+    frequency. We're just re-spacing the samples; linear interpolation
+    adds minimal aliasing and is ~10× cheaper than a polyphase FIR.
     """
     if x.size == 0 or src_rate == dst_rate:
         return x.astype(np.float32, copy=True)

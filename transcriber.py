@@ -805,44 +805,67 @@ def cmd_setup(args):
 
 # ─── Recording ────────────────────────────────────────────────────────────────
 
-def _poll_mic_frame(vp_capture):
-    """Pull one (or more) frames from VPMicCapture, append to state['mic_frames'], update RMS.
+def _mic_pump(vp_capture, state, stop_event=None):
+    """Pump mic frames from VPMicCapture into `state["mic_frames"]`.
+
+    Shared by `cmd_record` (called from the main recording loop) and
+    `cmd_live` (called from a dedicated `_mic_pump_thread`).
+
+    Stops when the consumer sets `state["recording"] = False` (auto-stop
+    on silence), or — when `stop_event` is provided — when that event fires
+    (live-mode shutdown).
 
     Returns True if recording should continue, False to signal stop.
     """
     chunk, _overflow = vp_capture.read_chunk(timeout=0.1)
     if chunk is None or len(chunk) == 0:
         return True
-    mono2d = chunk.reshape(-1, 1).astype(np.float32)
-    state_ref = vp_capture._state_ref
-    if state_ref["paused"]:
+    if state.get("paused", False):
         return True
-    with state_ref["lock"]:
-        state_ref["mic_frames"].append(mono2d)
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
-        state_ref["current_mic_rms"] = rms
+    rms = float(np.sqrt(np.mean(chunk ** 2)))
+    mono2d = chunk.reshape(-1, 1).astype(np.float32)
+    with state["lock"]:
+        state["mic_frames"].append(mono2d)
+        if "current_mic_rms" in state:
+            state["current_mic_rms"] = rms
+        if "mic_rms_val" in state:
+            state["mic_rms_val"] = rms
+        if "current_rms" in state:
+            state["current_rms"] = max(state["current_rms"], rms)
         if rms < SILENCE_THRESHOLD:
-            if state_ref["silence_start"] is None:
-                state_ref["silence_start"] = time.time()
-            elif time.time() - state_ref["silence_start"] >= SILENCE_TIMEOUT:
-                state_ref["recording"] = False
+            if state["silence_start"] is None:
+                state["silence_start"] = time.time()
+            elif time.time() - state["silence_start"] >= SILENCE_TIMEOUT:
+                state["recording"] = False
                 return False
         else:
-            state_ref["silence_start"] = None
+            state["silence_start"] = None
     return True
 
 
+def _mic_pump_thread(vp_capture, state, stop_event):
+    """Dedicated mic-pump thread used by `cmd_live`.
+
+    Polls VPMicCapture and appends to state['mic_frames'] until either
+    `stop_event` is set or the auto-stop silence threshold trips.
+    """
+    while not stop_event.is_set() and state.get("recording", True):
+        if not _mic_pump(vp_capture, state, stop_event):
+            return
+
+
 def _sys_silence_callback(indata, _frames, _time, _status, *, state):
-    """sounddevice/SCK callback for the system channel — fills sys_frames + resets silence timer."""
-    if not state["recording"]:
+    """SCK callback for the system channel — fills sys_frames + resets silence timer."""
+    if not state.get("recording", True):
         return
-    if state["paused"]:
+    if state.get("paused", False):
         return
     mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
     with state["lock"]:
         state["sys_frames"].append(mono.copy())
-        state["current_sys_rms"] = float(np.sqrt(np.mean(mono ** 2)))
-        if state["current_sys_rms"] > SILENCE_THRESHOLD:
+        if "current_sys_rms" in state:
+            state["current_sys_rms"] = float(np.sqrt(np.mean(mono ** 2)))
+        if state.get("current_sys_rms", 0) > SILENCE_THRESHOLD:
             state["silence_start"] = None
 
 
@@ -892,9 +915,8 @@ def _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode):
             if paused:
                 state["silence_start"] = None
 
-            # Poll mic (VPIO)
-            vp_capture._state_ref = state
-            if not _poll_mic_frame(vp_capture):
+            # Pump mic (VPIO) — returns False when silence timeout trips
+            if not _mic_pump(vp_capture, state):
                 state["recording"] = False
                 break
 
@@ -982,7 +1004,6 @@ def cmd_record(args):
     auto_stopped = False
     display = RecordingDisplay()
     try:
-        vp_capture._state_ref = state
         vp_capture.start()
         if sck_capture:
             sck_capture.start()
@@ -1602,36 +1623,7 @@ def _print_stop_summary(auto_stopped, elapsed, rec_only, chunks_done):
         print(f"  📊 {chunks_done} chunks pre-transcribed during recording")
 
 
-def _live_mic_poll_thread(vp_capture, state, stop_event):
-    """Dedicated thread: poll VPMicCapture chunks and append to state['mic_frames'].
-
-    This replaces the sounddevice callback that used to fill mic_frames during
-    live mode. Runs until stop_event is set or recording state goes False.
-    """
-    vp_capture._state_ref = state
-    while not stop_event.is_set() and state["recording"]:
-        chunk, _overflow = vp_capture.read_chunk(timeout=0.1)
-        if chunk is None or len(chunk) == 0:
-            continue
-        if state.get("paused", False):
-            continue
-        mono2d = chunk.reshape(-1, 1).astype(np.float32)
-        with state["lock"]:
-            state["mic_frames"].append(mono2d)
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
-            state["mic_rms_val"] = rms
-            state["current_rms"] = max(state["current_rms"], rms)
-            if rms < SILENCE_THRESHOLD:
-                if state["silence_start"] is None:
-                    state["silence_start"] = time.time()
-                elif time.time() - state["silence_start"] >= SILENCE_TIMEOUT:
-                    state["recording"] = False
-                    return
-            else:
-                state["silence_start"] = None
-
-
-def _run_live_session(vp_capture, sck_capture, transcription_thread, mic_poll_thread,
+def _run_live_session(vp_capture, sck_capture, transcription_thread, mic_pump_thread,
                      state, dual_mode):
     """Start VPIO, SCK, transcription + mic poll threads; run the display loop.
 
