@@ -1635,7 +1635,7 @@ def _run_live_session(vp_capture, sck_capture, transcription_thread, mic_pump_th
         if sck_capture:
             sck_capture.start()
         transcription_thread.start()
-        mic_poll_thread.start()
+        mic_pump_thread.start()
         _run_live_display_loop(state, dual_mode)
         auto_stopped = True
     except KeyboardInterrupt:
@@ -1685,7 +1685,7 @@ def _setup_live_recording(state, model_name, language, dual_mode, get_snapshot):
 
     vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE)
     mic_poll_thread = threading.Thread(
-        target=_live_mic_poll_thread,
+        target=_mic_pump_thread,
         args=(vp_capture, state, stop_event),
         daemon=True,
     )
