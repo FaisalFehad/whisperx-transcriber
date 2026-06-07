@@ -1613,7 +1613,7 @@ def _live_mic_poll_thread(vp_capture, state, stop_event):
         chunk, _overflow = vp_capture.read_chunk(timeout=0.1)
         if chunk is None or len(chunk) == 0:
             continue
-        if state["paused"]:
+        if state.get("paused", False):
             continue
         mono2d = chunk.reshape(-1, 1).astype(np.float32)
         with state["lock"]:
