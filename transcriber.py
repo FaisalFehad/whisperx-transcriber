@@ -87,35 +87,6 @@ DEFAULT_CONFIG = {
     "audio": {
         # Keep the source WAV after successful transcription (True) or delete it (False)
         "keep_recording": True,
-        # Diarise mic channel (for conference room with multiple local speakers)
-        # False (default): mic = "You" — fastest, correct when alone at desk
-        # True: run Sortformer on mic channel too to separate local speakers
-        "diarise_mic": True,
-        # Echo-suppression aggressiveness. Affects transcript-level dedup thresholds
-        # only — NOT an audio-layer echo canceller. See CLAUDE.md Caveat 1.
-        #   "auto"         — scale thresholds by per-file bleed score (recommended)
-        #   "conservative" — always use the high (sim_max, overlap_max) thresholds
-        #   "aggressive"   — always use the low (sim_min, overlap_min) thresholds
-        "dedup_aggressiveness": "auto",
-        # Tunable threshold coefficients for the dynamic bleed-aware dedup.
-        # _max values are used at bleed_score=0 (no bleed detected),
-        # _min values are used at bleed_score=1 (saturated bleed).
-        # A mic segment is suppressed if (similarity AND overlap) OR
-        # (containment AND overlap) clears its tier's threshold.
-        #   similarity    — SequenceMatcher char-level ratio, paraphrase-like distortions
-        #   containment   — word-set subset ratio, truncation/segmentation artifacts
-        "dedup_sim_max": 0.92,
-        "dedup_sim_min": 0.75,
-        "dedup_overlap_max": 0.80,
-        "dedup_overlap_min": 0.55,
-        "dedup_cont_max": 0.90,
-        "dedup_cont_min": 0.55,
-        # Skip containment-based dedup for short mic segments (≤ N words).
-        # Common backchannels ("Yeah.", "Hello, how are you?", "Numbers.") match
-        # 100% on containment with the speaker's "Yeah" / "how are you" and would
-        # otherwise be eaten. Sim-only dedup has stricter thresholds so these
-        # are correctly preserved.
-        "dedup_backchannel_max_words": 3,
     },
 
     # Accepted audio file types for transcription and listing
@@ -719,100 +690,6 @@ def check_ram_for_model(model_name):
 
 # ─── Audio Device Detection ───────────────────────────────────────────────────
 
-class MicMonitor:
-    """Detect mic device changes via CoreAudio and hot-switch the PortAudio stream.
-
-    CoreAudio provides real-time device change detection (no cache).
-    When a change is detected, PortAudio is reinitialised to pick up the new device.
-    The old stream is stopped before the new one starts (~100ms gap).
-    """
-
-    def __init__(self):
-        self._last_check = 0.0
-        self._last_ca_id = -1
-        self._ca_lib = None
-        self._ca_setup = False
-        self.switch_count = 0
-
-    def _ensure_coreaudio(self):
-        """Load CoreAudio framework once."""
-        if self._ca_setup:
-            return self._ca_lib
-        self._ca_setup = True
-        try:
-            from ctypes import cdll
-            self._ca_lib = cdll.LoadLibrary(
-                "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
-            )
-        except Exception:
-            self._ca_lib = None
-        return self._ca_lib
-
-    def _get_ca_device_id(self):
-        """Query CoreAudio for the current default input device ID."""
-        ca = self._ensure_coreaudio()
-        if ca is None:
-            return -1
-        try:
-            if not hasattr(self, '_ca_addr'):
-                from ctypes import c_uint32, byref, Structure
-                class _Addr(Structure):
-                    _fields_ = [("s", c_uint32), ("sc", c_uint32), ("e", c_uint32)]
-                self._ca_types = (c_uint32, byref)
-                self._ca_addr = _Addr(0x64496E20, 0x676C6F62, 0)  # 'dIn ', 'glob', main
-            c_uint32, byref = self._ca_types
-            dev = c_uint32(0)
-            size = c_uint32(4)
-            if ca.AudioObjectGetPropertyData(1, byref(self._ca_addr), 0, None, byref(size), byref(dev)) == 0:
-                return dev.value
-        except Exception:
-            pass
-        return -1
-
-    def check_and_switch(self, mic_stream, current_mic_id, create_stream_fn, paused=False):
-        """Check for device change every 2s. Returns (stream, mic_id, mic_name, switched).
-
-        Call this from the recording loop. If no change detected, returns the
-        same stream and mic_id with switched=False.
-        """
-        import sounddevice as sd
-
-        now = time.time()
-        if paused or now - self._last_check < 2.0:
-            return mic_stream, current_mic_id, None, False
-        self._last_check = now
-
-        ca_id = self._get_ca_device_id()
-        if ca_id <= 0 or ca_id == self._last_ca_id:
-            if self._last_ca_id == -1:
-                self._last_ca_id = ca_id
-            return mic_stream, current_mic_id, None, False
-
-        self._last_ca_id = ca_id
-
-        # Device changed — reinit PortAudio and switch
-        try:
-            mic_stream.stop()
-            mic_stream.close()
-            sd._terminate()
-            sd._initialize()
-            new_id, new_name = get_default_mic()
-            if new_id is not None:
-                mic_stream = create_stream_fn(new_id)
-                mic_stream.start()
-                self.switch_count += 1
-                return mic_stream, new_id, new_name, True
-        except Exception:
-            # Recovery: restart on any available device
-            try:
-                sd._terminate()
-                sd._initialize()
-                mic_stream = create_stream_fn(current_mic_id)
-                mic_stream.start()
-            except Exception:
-                pass
-        return mic_stream, current_mic_id, None, False
-
 
 def _cleanup_temp_files(*paths):
     """Safe cleanup of multiple temporary files."""
@@ -892,41 +769,7 @@ def _is_real_input_device(name, max_input_channels):
     return not any(v in name for v in VIRTUAL_DEVICE_NAMES)
 
 
-def _try_default_system_mic():
-    """Pass 1: trust the system default mic if it's a real (non-virtual) device."""
-    import sounddevice as sd
-    default_idx = sd.default.device[0]
-    if default_idx is None or default_idx < 0:
-        return None
-    try:
-        info = sd.query_devices(default_idx)
-    except Exception:
-        return None
-    name = info.get("name", "")
-    if not _is_real_input_device(name, info.get("max_input_channels", 0)):
-        return None
-    return default_idx, name
 
-
-def _find_best_real_mic():
-    """Pass 2: scan devices, prefer wireless, fall back to any real input."""
-    import sounddevice as sd
-    airpods_result = None
-    fallback_result = None
-    for i, d in enumerate(sd.query_devices()):
-        if not _is_real_input_device(d["name"], d["max_input_channels"]):
-            continue
-        is_wireless = any(k in d["name"] for k in _WIRELESS_HINTS)
-        if is_wireless and airpods_result is None:
-            airpods_result = (i, d["name"])
-        elif fallback_result is None:
-            fallback_result = (i, d["name"])
-    return airpods_result or fallback_result or (None, "Unknown")
-
-
-def get_default_mic():
-    """Get the best available real input device, preferring AirPods over MacBook mic."""
-    return _try_default_system_mic() or _find_best_real_mic()
 
 
 
@@ -1203,21 +1046,6 @@ def _pad_to_length(audio, target_len):
     return audio
 
 
-def _stereo_mix(mic_audio, sys_frames, normalise):
-    """Return stereo (N,2) — channel 0 = mic, channel 1 = system — padded to same length."""
-    sys_audio = np.concatenate(sys_frames) if sys_frames else np.array([], dtype=np.float32)
-    if normalise and sys_audio.size:
-        sys_audio = _normalise(sys_audio)
-    mic_audio = np.asarray(mic_audio).reshape(-1)
-    sys_audio = np.asarray(sys_audio).reshape(-1)
-    max_len = max(len(mic_audio), len(sys_audio))
-    mic_audio = _pad_to_length(mic_audio, max_len)
-    sys_audio = _pad_to_length(sys_audio, max_len)
-    _log("mix", mode="stereo", normalise=normalise, samples=max_len,
-         mic_rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}",
-         sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
-    return np.column_stack([mic_audio, sys_audio])
-
 
 def _mix_audio(mic_frames, sys_frames, dual_mode, normalise=True, mic_switch_points=None):
     """Combine mic + system audio. Returns stereo (N,2) when dual, mono (N,) when single.
@@ -1232,7 +1060,18 @@ def _mix_audio(mic_frames, sys_frames, dual_mode, normalise=True, mic_switch_poi
 
     mic_audio = _normalise_mic(mic_frames, normalise, mic_switch_points)
     if dual_mode and sys_frames:
-        return _stereo_mix(mic_audio, sys_frames, normalise)
+        sys_audio = np.concatenate(sys_frames) if sys_frames else np.array([], dtype=np.float32)
+        if normalise and sys_audio.size:
+            sys_audio = _normalise(sys_audio)
+        mic_audio = np.asarray(mic_audio).reshape(-1)
+        sys_audio = np.asarray(sys_audio).reshape(-1)
+        max_len = max(len(mic_audio), len(sys_audio))
+        mic_audio = _pad_to_length(mic_audio, max_len)
+        sys_audio = _pad_to_length(sys_audio, max_len)
+        _log("mix", mode="stereo", normalise=normalise, samples=max_len,
+             mic_rms=f"{np.sqrt(np.mean(mic_audio**2)):.5f}",
+             sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
+        return np.column_stack([mic_audio, sys_audio])
 
     mic_audio = np.asarray(mic_audio).reshape(-1)
     _log("mix", mode="mono", normalise=normalise, samples=len(mic_audio),
@@ -1326,14 +1165,6 @@ def _check_diarise(no_diarise):
     return wanted
 
 
-def _make_mic_stream(dev_id, blocksize, callback):
-    """Create a sounddevice InputStream for mic recording."""
-    import sounddevice as sd
-    return sd.InputStream(
-        samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-        device=dev_id, blocksize=blocksize, callback=callback,
-    )
-
 
 def _offset_and_filter_segments(segments, offset, overlap_boundary):
     """Apply time offset to segments and keep only those whose midpoint exceeds overlap_boundary."""
@@ -1372,25 +1203,6 @@ def _preload_live_model(model_name):
     print(f"  ✅ Model ready — starting recording")
     return True
 
-
-def _mic_live_callback(indata, _frames, _time, _status, *, state):
-    """sounddevice callback for live-mode mic channel (silence + RMS tracking)."""
-    import sounddevice as sd
-    if not state["recording"]:
-        raise sd.CallbackAbort()
-    mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
-    with state["lock"]:
-        state["mic_frames"].append(mono.copy())
-        state["mic_rms_val"] = float(np.sqrt(np.mean(mono ** 2)))
-        state["current_rms"] = state["mic_rms_val"]
-        if state["current_rms"] < SILENCE_THRESHOLD:
-            if state["silence_start"] is None:
-                state["silence_start"] = time.time()
-            elif time.time() - state["silence_start"] >= SILENCE_TIMEOUT:
-                state["recording"] = False
-                raise sd.CallbackAbort()
-        else:
-            state["silence_start"] = None
 
 
 def _sys_live_callback(indata, _frames, _time, _status, *, state):
@@ -1678,7 +1490,7 @@ def _run_live_diarisation(result, output_path, no_diarise):
 
 
 def _diarise_stereo_live(result, output_path):
-    """Diarise a stereo result by splitting channels and reassigning per side."""
+    """Diarise a stereo live result by splitting channels and reassigning per side."""
     mic_tmp, sys_tmp = _split_stereo(output_path)
     try:
         sys_turns = _diarise_standalone(sys_tmp)
@@ -1688,13 +1500,10 @@ def _diarise_stereo_live(result, output_path):
         mic_segs = [s for s in result["segments"] if s.get("_source_channel") == "mic"]
         if sys_segs:
             sys_segs = _assign_speakers_to_segments(sys_segs, sys_turns)
-        if config["audio"].get("diarise_mic", True):
+        if mic_segs:
             mic_turns = _diarise_standalone(mic_tmp)
-            if mic_turns and mic_segs:
+            if mic_turns:
                 mic_segs = _assign_speakers_to_segments(mic_segs, mic_turns)
-                _relabel_local_speakers(mic_segs)
-        else:
-            _label_mic_speaker(mic_segs, config)
         result["segments"] = sorted(sys_segs + mic_segs, key=lambda s: s.get("start", 0))
     finally:
         _cleanup_temp_files(mic_tmp, sys_tmp)
@@ -2108,38 +1917,6 @@ def _is_stereo(audio_path):
 
 
 
-def _label_mic_speaker(segments, config):
-    """Assign a single speaker label to all mic-channel segments.
-
-    Used when mic-channel diarisation is disabled — the entire mic channel is
-    treated as belonging to one person at the keyboard. The label is the
-    configured `user_name` from config, falling back to "You".
-    Modifies segments in-place.
-    """
-    mic_label = config.get("user_name", "You") or "You"
-    for seg in segments:
-        seg["speaker"] = mic_label
-
-
-def _relabel_local_speakers(segments):
-    """Rename Sortformer 'Speaker N' labels on mic-channel segments to 1-based 'Local N+1'.
-
-    Sortformer emits 0-based IDs ('Speaker 0'..'Speaker 3'); the rest of the
-    pipeline expects 1-based local labels so they don't collide with remote
-    speakers that share the same Sortformer ID space. Segments whose label
-    does not match the 'Speaker N' pattern are left untouched.
-
-    Modifies segments in-place. Returns nothing.
-    """
-    for seg in segments:
-        spk = seg.get("speaker", "")
-        if not spk.startswith("Speaker "):
-            continue
-        try:
-            num = int(spk.split(" ", 1)[1]) + 1
-        except (IndexError, ValueError):
-            num = 1
-        seg["speaker"] = f"Local {num}"
 
 
 def _split_stereo(audio_path, sr=16000):
@@ -2169,266 +1946,17 @@ def _split_stereo(audio_path, sr=16000):
     return mic_path, sys_path
 
 
-_ECHO_THRESHOLDS = {
-    "suppress_similarity": 0.92,
-    "suppress_overlap": 0.80,
-    "suppress_containment": 0.90,
-    "weak_similarity": 0.85,
-    "weak_overlap": 0.50,
-    "weak_containment": 0.80,
-    "backchannel_max_words": 3,
-}
 
 
-def _estimate_bleed_dominance(mic, sys_audio, sr=16000, window_seconds=1.0):
-    """Estimate how much mic audio is dominated by system bleed (0.0–1.0).
-
-    Returns a dict with score, ratio, r2, duration. Used to scale transcript-level
-    dedup thresholds: high score → more aggressive dedup. See CLAUDE.md Caveat 1.
-
-    - ratio = mean(mic_rms) / mean(sys_rms) — how loud mic is relative to system
-    - r2    = coefficient of determination of per-window linear fit (mic vs sys)
-    - score = clamp(ratio * r2, 0, 1)
-
-    Score 0.0 → no bleed (silent mic or independent speech).
-    Score 1.0 → mic amplitude tracks system perfectly → saturated bleed.
-
-    Accepts numpy arrays OR file paths (str); loads paths via ffmpeg.
-    """
-    if isinstance(mic, str):
-        mic = _load_audio(mic, sr=sr)
-    if isinstance(sys_audio, str):
-        sys_audio = _load_audio(sys_audio, sr=sr)
-    n = min(len(mic), len(sys_audio))
-    duration = n / sr
-    win = int(sr * window_seconds)
-    if n < sr or win <= 0 or n // win < 2:
-        return {"score": 0.0, "ratio": 0.0, "r2": 0.0, "duration": duration}
-
-    n_windows = n // win
-    mic_rms = np.array([np.sqrt(np.mean(mic[i*win:(i+1)*win]**2)) for i in range(n_windows)])
-    sys_rms = np.array([np.sqrt(np.mean(sys_audio[i*win:(i+1)*win]**2)) for i in range(n_windows)])
-
-    mean_sys = float(np.mean(sys_rms))
-    ratio = float(np.mean(mic_rms) / mean_sys) if mean_sys > 1e-6 else 0.0
-
-    if mean_sys > 1e-6 and float(np.std(sys_rms)) > 1e-6:
-        b, a = np.polyfit(sys_rms, mic_rms, 1)
-        predicted = a + b * sys_rms
-        ss_res = float(np.sum((mic_rms - predicted) ** 2))
-        ss_tot = float(np.sum((mic_rms - np.mean(mic_rms)) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
-    else:
-        r2 = 0.0
-
-    score = max(0.0, min(1.0, ratio * max(0.0, r2)))
-    return {"score": score, "ratio": ratio, "r2": r2, "duration": duration}
 
 
-def _tag_source_channel(segments, channel):
-    """Stamp each segment with its source channel (for dedup + debug)."""
-    for seg in segments:
-        seg["_source_channel"] = channel
 
 
-def _overlap_ratio(seg_start, seg_end, sys_start, sys_end):
-    """Return fraction of the shorter segment overlapped by the longer one."""
-    overlap_time = min(seg_end, sys_end) - max(seg_start, sys_start)
-    if overlap_time <= 0:
-        return 0.0
-    shorter = min(seg_end - seg_start, sys_end - sys_start)
-    return overlap_time / shorter if shorter > 0 else 0.0
 
 
-def _normalize_text(s):
-    """Lowercase, strip punctuation (keep apostrophes), collapse whitespace.
-
-    Reduces "And let's say, beyond the surface..." and "And let's say beyond
-    the surface..." to the same string, so an extra comma in ASR output does
-    not collapse similarity/containment scores.
-    """
-    import re
-    s = s.lower()
-    s = re.sub(r"[^\w\s']", " ", s)
-    return " ".join(s.split())
 
 
-def _text_similarity(a, b):
-    """SequenceMatcher ratio between two strings (0.0–1.0). Operates on the
-    raw input — callers should pass already-normalized text for stable
-    results on long similar strings with small ASR differences."""
-    import difflib
-    return difflib.SequenceMatcher(None, a, b).ratio()
 
-
-def _word_containment(a, b):
-    """Max word-set containment between two strings: max(|A∩B|/|A|, |A∩B|/|B|).
-
-    Returns 1.0 when one text's words are a subset of the other's. Operates
-    on already-normalized input (whitespace-split tokens, lowercased).
-    """
-    wa = {w for w in a.split() if w}
-    wb = {w for w in b.split() if w}
-    if not wa or not wb:
-        return 0.0
-    inter = wa & wb
-    return max(len(inter) / len(wa), len(inter) / len(wb))
-
-
-def _sys_authoritative(mic_seg, sys_seg):
-    """System segment is authoritative when it is at least as confident as mic.
-
-    Falls back to True when either side lacks a confidence key (legacy data).
-    """
-    if "confidence" in sys_seg and "confidence" in mic_seg:
-        return sys_seg["confidence"] >= mic_seg["confidence"]
-    return True
-
-
-def _classify_echo(similarity, containment, overlap_ratio, sys_authoritative, thresholds=None):
-    """Return echo status. Suppresses if EITHER similarity OR containment
-    clears the suppress thresholds (both paired with overlap); same for the
-    weak tier. The two metrics capture different failure modes:
-    • similarity catches paraphrase-like ASR distortions
-    • containment catches truncation and segmentation artifacts
-    Returns "suppressed", "weak_duplicate", or None.
-    `thresholds` overrides the default _ECHO_THRESHOLDS (used for dynamic
-    bleed-aware scaling).
-    """
-    if not sys_authoritative:
-        return None
-    t = thresholds if thresholds is not None else _ECHO_THRESHOLDS
-    sim_sup = similarity > t["suppress_similarity"] and overlap_ratio > t["suppress_overlap"]
-    cont_sup = containment > t["suppress_containment"] and overlap_ratio > t["suppress_overlap"]
-    if sim_sup or cont_sup:
-        return "suppressed"
-    sim_weak = similarity > t["weak_similarity"] and overlap_ratio > t["weak_overlap"]
-    cont_weak = containment > t["weak_containment"] and overlap_ratio > t["weak_overlap"]
-    if sim_weak or cont_weak:
-        return "weak_duplicate"
-    return None
-
-
-def _scan_overlapping_sys(seg, sys_by_time):
-    """Yield system segments that overlap the given mic segment, in time order.
-
-    Stops as soon as system segments are past the mic segment's end.
-    """
-    seg_start = seg.get("start", 0)
-    seg_end = seg.get("end", 0)
-    for sys_seg in sys_by_time:
-        sys_start = sys_seg.get("start", 0)
-        sys_end = sys_seg.get("end", 0)
-        if sys_start >= seg_end:
-            return
-        if sys_end > seg_start:
-            yield sys_seg
-
-
-def _dedup_mic_segment(seg, sys_by_time, counters, thresholds=None):
-    """Apply 3-tier echo suppression to a single mic segment.
-
-    Compares the mic segment against the UNION of all overlapping system
-    segments (concatenated text). This handles the case where the system
-    split a single utterance into multiple ASR segments while the mic's
-    echo of the same utterance came through as one segment.
-
-    Text is normalized (lowercase, punctuation stripped, whitespace
-    collapsed) before scoring so that an extra comma or split punctuation
-    doesn't collapse the similarity/containment score.
-
-    Suppresses if EITHER similarity OR containment passes the threshold.
-    Mutates seg["_echo_status"] and updates counters; returns True if the
-    segment should be KEPT in the final transcript.
-    """
-    seg_dur = seg.get("end", 0) - seg.get("start", 0)
-    if seg_dur <= 0:
-        return True
-
-    overlapping = list(_scan_overlapping_sys(seg, sys_by_time))
-    if not overlapping:
-        seg.setdefault("_echo_status", None)
-        return True
-
-    mic_text = _normalize_text(seg.get("text", ""))
-    union_text = _normalize_text(" ".join(s.get("text", "") for s in overlapping))
-    union_start = overlapping[0].get("start", 0)
-    union_end = overlapping[-1].get("end", 0)
-
-    similarity = _text_similarity(mic_text, union_text)
-    mic_word_count = len(mic_text.split())
-    backchannel_limit = (thresholds or {}).get("backchannel_max_words", 3)
-    is_backchannel = mic_word_count <= backchannel_limit
-    containment = 0.0 if is_backchannel else _word_containment(mic_text, union_text)
-    overlap = _overlap_ratio(seg.get("start", 0), seg.get("end", 0),
-                             union_start, union_end)
-    status = _classify_echo(similarity, containment, overlap,
-                            _sys_authoritative(seg, overlapping[0]),
-                            thresholds=thresholds)
-
-    seg["_echo_similarity"] = round(similarity, 4)
-    seg["_echo_containment"] = round(containment, 4)
-    seg["_echo_overlap"] = round(overlap, 4)
-    seg["_echo_sys_segs"] = len(overlapping)
-
-    if status == "suppressed":
-        seg["_echo_status"] = "suppressed"
-        counters["suppressed"] += 1
-        return False
-    if status == "weak_duplicate":
-        seg["_echo_status"] = "weak_duplicate"
-        counters["weak"] += 1
-
-    seg.setdefault("_echo_status", None)
-    return True
-
-
-def _count_crosstalk(segments):
-    """Count consecutive segment pairs that overlap in time (crosstalk marker)."""
-    overlaps = 0
-    for prev, nxt in zip(segments, segments[1:]):
-        if prev.get("end", 0) > nxt.get("start", 0):
-            overlaps += 1
-    return overlaps
-
-
-def _build_dedup_thresholds(audio_cfg, bleed_metrics):
-    """Derive dedup thresholds from config + optional bleed metrics.
-
-    Returns a thresholds dict compatible with _classify_echo / _dedup_mic_segment.
-    aggressiveness="auto" scales continuously by bleed score (0=no bleed→max,
-    1=saturated bleed→min). "conservative" pins to max, "aggressive" pins to min.
-
-    Two metrics are scaled in parallel:
-    • similarity (SequenceMatcher char-level) — catches paraphrase-like distortions
-    • containment (word-set subset) — catches truncation and segmentation artifacts
-    A pair is suppressed if EITHER passes its threshold (in addition to overlap).
-    """
-    sim_max = audio_cfg.get("dedup_sim_max", 0.92)
-    sim_min = audio_cfg.get("dedup_sim_min", 0.75)
-    ov_max = audio_cfg.get("dedup_overlap_max", 0.80)
-    ov_min = audio_cfg.get("dedup_overlap_min", 0.55)
-    cont_max = audio_cfg.get("dedup_cont_max", 0.90)
-    cont_min = audio_cfg.get("dedup_cont_min", 0.55)
-    mode = audio_cfg.get("dedup_aggressiveness", "auto")
-    if mode == "conservative":
-        score = 0.0
-    elif mode == "aggressive":
-        score = 1.0
-    else:
-        score = (bleed_metrics or {}).get("score", 0.0)
-    sim_t = sim_max - (sim_max - sim_min) * score
-    ov_t = ov_max - (ov_max - ov_min) * score
-    cont_t = cont_max - (cont_max - cont_min) * score
-    return {
-        "suppress_similarity": sim_t,
-        "suppress_overlap": ov_t,
-        "suppress_containment": cont_t,
-        "weak_similarity": max(0.0, sim_t - 0.07),
-        "weak_overlap": max(0.0, ov_t - 0.30),
-        "weak_containment": max(0.0, cont_t - 0.10),
-        "backchannel_max_words": audio_cfg.get("dedup_backchannel_max_words", 3),
-    }
 
 
 def _interleave_by_timestamp(mic_result, sys_result):
@@ -2923,9 +2451,10 @@ def _label_mic_segments(mic_result, mic_turns):
     segments = mic_result.get("segments", [])
     if mic_turns:
         mic_result["segments"] = _assign_speakers_to_segments(segments, mic_turns)
-        _relabel_local_speakers(mic_result.get("segments", []))
-        return
-    _label_mic_speaker(segments, config)
+    else:
+        mic_label = config.get("user_name", "You") or "You"
+        for seg in segments:
+            seg["speaker"] = mic_label
 
 
 def _label_sys_segments(sys_result, sys_turns):
@@ -2933,9 +2462,9 @@ def _label_sys_segments(sys_result, sys_turns):
     segments = sys_result.get("segments", [])
     if sys_turns:
         sys_result["segments"] = _assign_speakers_to_segments(segments, sys_turns)
-        return
-    for seg in segments:
-        seg["speaker"] = "Remote"
+    else:
+        for seg in segments:
+            seg["speaker"] = "Remote"
 
 
 def _normalise_stereo_channels(mic_path, sys_path):
@@ -2945,6 +2474,7 @@ def _normalise_stereo_channels(mic_path, sys_path):
         ch_audio = _load_audio(ch_path, sr=SAMPLE_RATE)
         ch_audio = _normalise(ch_audio)
         sf.write(ch_path, ch_audio, SAMPLE_RATE)
+
 
 
 def _run_stereo_pipeline(transcribe_path, model_name, language, normalise_enabled,
