@@ -36,6 +36,9 @@ watch-stderr.log
 # macOS
 .DS_Store
 
+# Agent config (personal planning files)
+.opencode/
+
 # IDE
 .vscode/
 .idea/

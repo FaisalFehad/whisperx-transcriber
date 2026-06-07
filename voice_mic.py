@@ -1,15 +1,22 @@
-"""Microphone capture via Apple's VoiceProcessingIO AudioUnit (macOS 10.14+).
+"""Microphone capture via AVAudioEngine (macOS 10.14+).
 
-Voice processing performs hardware acoustic echo cancellation at the audio
-layer — the captured stream has system playback bleed removed before it
-leaves the unit, so downstream code no longer needs transcript-level dedup.
+Optional VoiceProcessingIO mode enables hardware acoustic echo cancellation
+at the audio layer — the captured stream has system playback bleed removed
+before it leaves the unit. When voice processing is disabled, captures raw
+mic audio (system bleed handled by transcript-level dedup downstream).
 
-Uses AVAudioEngine.installTap with setVoiceProcessingEnabled. Apple's official
-high-level API; the alternative (ctypes + AudioUnitRender + render-notify
-callbacks) starves the GIL because every audio callback grabs it.
+Uses AVAudioEngine.installTap. Apple's official high-level API; the
+alternative (ctypes + AudioUnitRender + render-notify callbacks) starves
+the GIL because every audio callback grabs it.
 
-The tap delivers 3 channels: [0] = AEC-processed mic, [1] = raw mic (pre-AEC),
-[2] = reference signal (what was sent to the speakers). We keep only [0].
+With voice processing enabled the tap delivers 3 channels:
+  [0] = AEC-processed mic, [1] = raw mic (pre-AEC), [2] = reference signal.
+We keep only [0].
+
+NOTE: VoiceProcessingIO has known issues on some macOS versions:
+  - May interfere with system audio output (volume reduction)
+  - May produce silent mic output if AEC malfunctions
+Default is voice_processing=False (raw mic). Enable via config if needed.
 
 Setup
 -----
@@ -19,7 +26,7 @@ Setup
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
@@ -30,7 +37,7 @@ except ImportError:
     _AVAILABLE = False
 
 
-# Float32 item size — what VPIO hands us per channel sample.
+# Float32 item size — what the audio tap hands us per channel sample.
 _F32_BYTES = np.dtype(np.float32).itemsize
 
 # Default sample rate the rest of the pipeline expects. The AVAudioEngine tap
@@ -44,14 +51,21 @@ _TAP_BUFFER_FRAMES = 4096
 
 
 class VPMicCapture:
-    """AVAudioEngine-based mic capture with hardware acoustic echo cancellation.
+    """AVAudioEngine-based mic capture with optional hardware AEC.
 
     Producer-only: the tap callback fills an internal queue, callers drain
-    via `read_chunk()` or `drain()`. No external state coupling.
+    via `read_chunk()`. No external state coupling.
+
+    Args:
+        sample_rate: Target sample rate (default 16000).
+        callback: Optional callback(frames_2d, frame_count, None, None).
+        voice_processing: Enable Apple's VoiceProcessingIO AEC. WARNING: may
+            interfere with system audio output and produce silent mic on some
+            macOS versions. Default False (raw mic capture).
 
     Usage
     -----
-        vp = VPMicCapture(sample_rate=16000, callback=my_fn)
+        vp = VPMicCapture(sample_rate=16000)
         vp.start()
         ...
         vp.read_chunk(timeout=0.1)   # → (frames, overflow_flag)
@@ -59,7 +73,8 @@ class VPMicCapture:
         vp.stop()
     """
 
-    def __init__(self, sample_rate: int = _DEFAULT_TARGET_RATE, callback=None):
+    def __init__(self, sample_rate: int = _DEFAULT_TARGET_RATE, callback=None,
+                 voice_processing: bool = False):
         if not _AVAILABLE:
             raise RuntimeError(
                 "pyobjc-framework-AVFoundation not installed.\n"
@@ -67,9 +82,10 @@ class VPMicCapture:
             )
         self._target_rate = sample_rate
         self._callback = callback
+        self._voice_processing = voice_processing
 
         self._engine = None
-        self._input_node: Optional["AVFoundation.AVAudioInputNode"] = None
+        self._input_node = None
         self._tap_bus = 0
         self._source_rate = 0
 
@@ -85,27 +101,24 @@ class VPMicCapture:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Set up the AVAudioEngine, enable voice processing, install the tap, start."""
+        """Set up the AVAudioEngine, install the tap, start."""
         if self._started:
             return
         self._engine = AVFoundation.AVAudioEngine.alloc().init()
         self._input_node = self._engine.inputNode()
 
-        # Enable Apple's hardware acoustic echo cancellation. This is the entire
-        # reason this module exists — without it, the mic picks up speaker
-        # playback and ASR transcribes both.
-        ok, err = self._input_node.setVoiceProcessingEnabled_error_(True, None)
-        if not ok:
-            err_str = err.localizedDescription() if err is not None else "unknown"
-            self._engine = None
-            self._input_node = None
-            raise RuntimeError(f"setVoiceProcessingEnabled failed: {err_str}")
+        if self._voice_processing:
+            # Enable Apple's hardware AEC.
+            ok, err = self._input_node.setVoiceProcessingEnabled_error_(True, None)
+            if not ok:
+                err_str = err.localizedDescription() if err is not None else "unknown"
+                self._engine = None
+                self._input_node = None
+                raise RuntimeError(f"setVoiceProcessingEnabled failed: {err_str}")
 
-        # Tap on the input bus. Apple's VPIO returns 3 channels:
-        #   ch0: AEC-processed mic (this is what we want)
-        #   ch1: raw mic (pre-AEC, for diagnostics)
-        #   ch2: reference signal (what the speakers played)
-        # We extract ch0 in the tap callback.
+
+
+        # Tap on the input bus.
         fmt = self._input_node.outputFormatForBus_(self._tap_bus)
         if fmt is None:
             self._engine = None
@@ -153,24 +166,6 @@ class VPMicCapture:
                 return self._frames.pop(0), False
         return None, False
 
-    def drain(self) -> np.ndarray:
-        """Drain all buffered frames and return as a single 1-D array."""
-        with self._lock:
-            if not self._frames:
-                return np.zeros(0, dtype=np.float32)
-            out = np.concatenate(self._frames).astype(np.float32)
-            self._frames.clear()
-            return out
-
-    @property
-    def overflow(self) -> int:
-        return self._overflow
-
-    @property
-    def source_rate(self) -> int:
-        """Hardware rate the tap delivers at (0 before start())."""
-        return self._source_rate
-
     def __enter__(self):
         self.start()
         return self
@@ -198,9 +193,9 @@ class VPMicCapture:
     def _tap_block(self, buf, when):
         """Block called by AVAudioEngine on a real-time audio thread.
 
-        Extracts channel 0 (the AEC-processed mic), downsamples to the target
-        rate, and hands it to the consumer queue. No blocking work happens
-        here.
+        Extracts channel 0 (mic or AEC-processed mic depending on voice_processing),
+        downsamples to the target rate, and hands it to the consumer queue.
+        No blocking work happens here.
         """
         try:
             if buf is None:
@@ -209,10 +204,11 @@ class VPMicCapture:
             if frame_count <= 0:
                 return
 
-            # floatChannelData returns a tuple of "varlist" objects wrapping
-            # UnsafePointer<Float>. Channel 0 is the AEC-cleaned mic.
-            # as_buffer(n_bytes) gives a memoryview of the first n_bytes.
-            ch0 = buf.floatChannelData()[0]
+            channels = buf.floatChannelData()
+            if channels is None or len(channels) == 0:
+                return
+
+            ch0 = channels[0]
             raw = np.frombuffer(
                 ch0.as_buffer(frame_count * _F32_BYTES),
                 dtype=np.float32,

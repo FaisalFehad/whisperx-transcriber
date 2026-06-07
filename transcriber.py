@@ -15,6 +15,7 @@ import os
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"  # suppress tqdm "Fetching N files" bars
 
 import argparse
+import copy
 import gc
 import json
 import re
@@ -24,10 +25,14 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
+import wave
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+
+from ui import format_duration
 
 try:
     from system_audio import SystemAudioCapture as _SystemAudioCapture
@@ -87,10 +92,13 @@ DEFAULT_CONFIG = {
     "audio": {
         # Keep the source WAV after successful transcription (True) or delete it (False)
         "keep_recording": True,
+        # Use Apple VoiceProcessingIO for hardware AEC during recording.
+        # Removes system audio bleed from mic at the audio layer.
+        "voice_processing": False,
     },
 
     # Accepted audio file types for transcription and listing
-    "audio_formats": [".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm"],
+    "audio_formats": [".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".qta"],
 
     # ── Auto-title ─────────────────────────────────────────────────────
     # If true, uses current calendar event title as transcript name
@@ -249,7 +257,6 @@ def load_config():
         except (json.JSONDecodeError, OSError) as e:
             print(f"  ⚠  Error reading config.json: {e}")
             print("     Using default settings.")
-    import copy
     return copy.deepcopy(DEFAULT_CONFIG)
 
 
@@ -273,7 +280,6 @@ SILENCE_THRESHOLD = config["recording"]["silence_threshold"]
 SILENCE_TIMEOUT = config["recording"]["silence_timeout_minutes"] * 60
 
 AUDIO_FORMATS = tuple(config["audio_formats"])
-VIRTUAL_DEVICE_NAMES = tuple(config["recording"]["virtual_device_names"])
 MIC_LOW_WARNING_SECONDS = config["recording"]["mic_low_warning_seconds"]
 
 MODEL_INFO = config["models"]
@@ -429,11 +435,20 @@ def _safe_write_text(target_path, content, description="file"):
                 return None
 
 
+def _write_wav(path, audio, sr):
+    """Write float32 [-1, 1] array as 16-bit mono WAV (stdlib)."""
+    audio_int16 = (audio * 32767.0).clip(-32768, 32767).astype(np.int16)
+    with wave.open(str(path), 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(audio_int16.tobytes())
+
+
 def _write_audio_wav(path, audio_data, sample_rate):
     """Write audio WAV and return the path; raise on failure."""
-    import soundfile as sf
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), audio_data, sample_rate, subtype="PCM_16")
+    _write_wav(path, audio_data, sample_rate)
     return path
 
 
@@ -578,7 +593,6 @@ def _format_history_row(run):
 
 def _per_model_speeds(runs):
     """Group speed ratios (audio_dur / proc_time) by model name."""
-    from collections import defaultdict
     stats = defaultdict(list)
     for run in runs:
         model = run.get("model")
@@ -630,9 +644,6 @@ def cmd_history(args):
 def clear_line():
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
-
-
-from ui import format_duration  # shared with ui.py
 
 
 def level_meter(rms, width=20):
@@ -759,17 +770,6 @@ def _save_transcript(result, audio_path, title, model_name, language,
     return output_file, speaker_names
 
 
-_WIRELESS_HINTS = ("AirPods", "Bluetooth", "Wireless", "Pro")
-
-
-def _is_real_input_device(name, max_input_channels):
-    """A real (non-virtual) input device."""
-    if max_input_channels <= 0:
-        return False
-    return not any(v in name for v in VIRTUAL_DEVICE_NAMES)
-
-
-
 
 
 
@@ -805,15 +805,11 @@ def cmd_setup(args):
 
 # ─── Recording ────────────────────────────────────────────────────────────────
 
-def _mic_pump(vp_capture, state, stop_event=None):
+def _mic_pump(vp_capture, state):
     """Pump mic frames from VPMicCapture into `state["mic_frames"]`.
 
     Shared by `cmd_record` (called from the main recording loop) and
     `cmd_live` (called from a dedicated `_mic_pump_thread`).
-
-    Stops when the consumer sets `state["recording"] = False` (auto-stop
-    on silence), or — when `stop_event` is provided — when that event fires
-    (live-mode shutdown).
 
     Returns True if recording should continue, False to signal stop.
     """
@@ -826,10 +822,8 @@ def _mic_pump(vp_capture, state, stop_event=None):
     mono2d = chunk.reshape(-1, 1).astype(np.float32)
     with state["lock"]:
         state["mic_frames"].append(mono2d)
-        if "current_mic_rms" in state:
-            state["current_mic_rms"] = rms
-        if "mic_rms_val" in state:
-            state["mic_rms_val"] = rms
+        if "mic_rms" in state:
+            state["mic_rms"] = rms
         if "current_rms" in state:
             state["current_rms"] = max(state["current_rms"], rms)
         if rms < SILENCE_THRESHOLD:
@@ -850,11 +844,11 @@ def _mic_pump_thread(vp_capture, state, stop_event):
     `stop_event` is set or the auto-stop silence threshold trips.
     """
     while not stop_event.is_set() and state.get("recording", True):
-        if not _mic_pump(vp_capture, state, stop_event):
+        if not _mic_pump(vp_capture, state):
             return
 
 
-def _sys_silence_callback(indata, _frames, _time, _status, *, state):
+def _sys_audio_callback(indata, _frames, _time, _status, *, state):
     """SCK callback for the system channel — fills sys_frames + resets silence timer."""
     if not state.get("recording", True):
         return
@@ -863,9 +857,9 @@ def _sys_silence_callback(indata, _frames, _time, _status, *, state):
     mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
     with state["lock"]:
         state["sys_frames"].append(mono.copy())
-        if "current_sys_rms" in state:
-            state["current_sys_rms"] = float(np.sqrt(np.mean(mono ** 2)))
-        if state.get("current_sys_rms", 0) > SILENCE_THRESHOLD:
+        if "sys_rms" in state:
+            state["sys_rms"] = float(np.sqrt(np.mean(mono ** 2)))
+        if state.get("sys_rms", 0) > SILENCE_THRESHOLD:
             state["silence_start"] = None
 
 
@@ -877,15 +871,21 @@ def _toggle_pause(key, paused, silence_ref):
     return new_paused, None if new_paused else silence_ref
 
 
-def _mic_low_warning(mic_rms, paused, mic_low_since):
-    """Return (warning_text, updated_mic_low_since) for the mic-too-quiet warning."""
+def _mic_low_warning(mic_rms, mic_low_since, paused=False, prefix=""):
+    """Return (warning_text, updated_mic_low_since) for the mic-too-quiet warning.
+
+    In record mode, paused is a toggle; in live mode, paused is always False.
+    prefix is prepended to the warning text (e.g. " ⚠" for live mode warnings
+    that appear inline in the status line).
+    """
+    no_warning = "" if prefix else None
     if paused or mic_rms >= 0.001:
-        return None, None
+        return no_warning, None
     if mic_low_since is None:
-        return None, time.time()
+        return no_warning, time.time()
     if time.time() - mic_low_since > MIC_LOW_WARNING_SECONDS:
-        return "Mic very low!", mic_low_since
-    return None, mic_low_since
+        return f"{prefix}Mic very low!", mic_low_since
+    return no_warning, mic_low_since
 
 
 def _maybe_system_health_warning(last_check, current_warning):
@@ -900,11 +900,8 @@ def _maybe_system_health_warning(last_check, current_warning):
     return time.time(), current_warning
 
 
-def _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode):
-    """Main display/keyboard loop. Polls VPMicCapture and SCK, drives silence detection.
-
-    Returns True if the loop ended normally (auto-stop).
-    """
+def _run_recording_loop(state, vp_capture, display, dual_mode):
+    """Main display/keyboard loop. Polls VPMicCapture and SCK, drives silence detection."""
     from ui import raw_keys, poll_key
     last_health_check = 0
     mic_low_since_rec = None
@@ -923,15 +920,15 @@ def _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode):
             # System audio is filled by SCK's callback (see cmd_record / cmd_live).
 
             with state["lock"]:
-                mic_rms = state["current_mic_rms"]
-                sys_rms_val = state["current_sys_rms"]
+                mic_rms = state["mic_rms"]
+                sys_rms_val = state["sys_rms"]
                 sil = state["silence_start"]
 
             rms = max(mic_rms, sys_rms_val)
             elapsed = time.time() - state["start_time"]
             silence_elapsed = time.time() - sil if sil else 0
 
-            mic_low_warn, mic_low_since_rec = _mic_low_warning(mic_rms, paused, mic_low_since_rec)
+            mic_low_warn, mic_low_since_rec = _mic_low_warning(mic_rms, mic_low_since_rec, paused=paused)
             last_health_check, warning = _maybe_system_health_warning(last_health_check, mic_low_warn)
 
             display.update(rms, elapsed, silence_elapsed, paused=paused,
@@ -980,17 +977,18 @@ def cmd_record(args):
         "recording": True,
         "paused": False,
         "silence_start": None,
-        "current_mic_rms": 0.0,
-        "current_sys_rms": 0.0,
+        "mic_rms": 0.0,
+        "sys_rms": 0.0,
         "start_time": time.time(),
         "lock": threading.Lock(),
         "mic_switch_frames": [],
     }
 
-    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE)
+    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE,
+                               voice_processing=config["audio"].get("voice_processing", False))
 
     def sys_callback(indata, frames, time_info, status):
-        _sys_silence_callback(indata, frames, time_info, status, state=state)
+        _sys_audio_callback(indata, frames, time_info, status, state=state)
 
     sck_capture = None
     if _SystemAudioCapture is not None:
@@ -1000,14 +998,14 @@ def cmd_record(args):
             print(f"  ⚠  System audio unavailable: {e}")
             dual_mode = False
 
-    from ui import RecordingDisplay, raw_keys, poll_key, check_system_health
+    from ui import RecordingDisplay
     auto_stopped = False
     display = RecordingDisplay()
     try:
         vp_capture.start()
         if sck_capture:
             sck_capture.start()
-        _run_recording_loop(state, vp_capture, sck_capture, display, dual_mode)
+        _run_recording_loop(state, vp_capture, display, dual_mode)
         auto_stopped = True
     except KeyboardInterrupt:
         state["recording"] = False
@@ -1216,28 +1214,15 @@ def _preload_live_model(model_name):
             from mlx_audio.stt import load as load_stt
             load_stt(config["mlx_models"].get(model_name, "mlx-community/parakeet-tdt-0.6b-v3"))
         else:
-            import mlx_whisper
+            pass
     except Exception as e:
         print(f"  ❌ Failed to load model '{model_name}': {e}")
-        print(f"  Check your internet connection — models download on first use.")
+        print("  Check your internet connection — models download on first use.")
         return False
-    print(f"  ✅ Model ready — starting recording")
+    print("  ✅ Model ready — starting recording")
     return True
 
 
-
-def _sys_live_callback(indata, _frames, _time, _status, *, state):
-    """sounddevice callback for live-mode system channel (resets silence timer)."""
-    import sounddevice as sd
-    if not state["recording"]:
-        raise sd.CallbackAbort()
-    mono = indata.mean(axis=1, keepdims=True) if indata.shape[1] > 1 else indata
-    with state["lock"]:
-        state["sys_frames"].append(mono.copy())
-        state["sys_rms_val"] = float(np.sqrt(np.mean(mono ** 2)))
-        if state["sys_rms_val"] > SILENCE_THRESHOLD:
-            state["silence_start"] = None
-            state["current_rms"] = max(state["current_rms"], state["sys_rms_val"])
 
 
 def _get_mixed_snapshot(lock, mic_frames, sys_frames, dual_mode):
@@ -1325,11 +1310,11 @@ def _transcription_worker(state, model_name, language, live_cfg, adaptive, stop_
             state["chunk_in_progress"] = False
 
 
-def _build_live_status_line(rms, m_rms, b_rms, dual_mode, elapsed, chunks_done, chunk_in_progress, rec_only, mic_warn):
+def _build_live_status_line(rms, m_rms, sys_rms, dual_mode, elapsed, chunks_done, chunk_in_progress, rec_only, mic_warn):
     """Compose the single-line status shown during live recording."""
     quality = f"Mic{_rms_emoji(m_rms)}"
     if dual_mode:
-        quality += f" Sys{_rms_emoji(b_rms)}"
+        quality += f" Sys{_rms_emoji(sys_rms)}"
     if rec_only:
         chunk_status = " │ REC only"
     else:
@@ -1344,35 +1329,22 @@ def _build_live_status_line(rms, m_rms, b_rms, dual_mode, elapsed, chunks_done, 
     )
 
 
-def _maybe_mic_low_warning(m_rms, mic_low_since):
-    """Return (warning_text, updated_mic_low_since) for the mic-too-quiet warning."""
-    if m_rms >= 0.001:
-        return "", None
-    if mic_low_since is None:
-        return "", time.time()
-    if time.time() - mic_low_since > MIC_LOW_WARNING_SECONDS:
-        return " ⚠ Mic very low!", mic_low_since
-    return "", mic_low_since
-
-
 def _run_live_display_loop(state, dual_mode):
     """UI / keyboard / display loop for live recording. Mutates state['mic_low_since']."""
     last_adaptive_msg = ""
     while state["recording"]:
         with state["lock"]:
             rms = state["current_rms"]
-            sil = state["silence_start"]
-            m_rms = state["mic_rms_val"]
-            b_rms = state["sys_rms_val"]
+            m_rms = state["mic_rms"]
+            sys_rms = state["sys_rms"]
 
         elapsed = time.time() - state["start_time"]
-        _ = time.time() - sil if sil else 0  # silence_elapsed (kept for parity, currently unused)
 
-        mic_warn, state["mic_low_since"] = _maybe_mic_low_warning(
-            m_rms, state["mic_low_since"])
+        mic_warn, state["mic_low_since"] = _mic_low_warning(
+            m_rms, state["mic_low_since"], prefix=" ⚠")
 
         status_line = _build_live_status_line(
-            rms, m_rms, b_rms, dual_mode, elapsed,
+            rms, m_rms, sys_rms, dual_mode, elapsed,
             state["chunks_done"], state["chunk_in_progress"],
             state["adaptive"]["rec_only"], mic_warn,
         )
@@ -1387,14 +1359,13 @@ def _run_live_display_loop(state, dual_mode):
         time.sleep(0.3)
 
 
-def _post_process_stereo(audio_data, output_path, model_name, language, live_cfg,
+def _post_process_stereo(audio_data, model_name, language, live_cfg,
                         last_transcribed_sample, rec_only, transcribed_segments):
     """Run stereo post-processing (split + per-channel ASR + merge). Returns segments."""
     tmp_fd, stereo_tmp = tempfile.mkstemp(suffix=".wav")
     os.close(tmp_fd)
     try:
-        import soundfile as sf
-        sf.write(stereo_tmp, audio_data, SAMPLE_RATE, subtype="PCM_16")
+        _write_wav(stereo_tmp, audio_data, SAMPLE_RATE)
         overlap_seconds = live_cfg["chunk_overlap_seconds"]
         remaining = len(audio_data) - last_transcribed_sample
         if rec_only and last_transcribed_sample == 0:
@@ -1505,35 +1476,54 @@ def _run_live_diarisation(result, output_path, no_diarise):
         if _is_stereo(str(output_path)):
             _diarise_stereo_live(result, str(output_path))
         else:
-            _diarise_mono_live(result, str(output_path))
+            speaker_turns = _diarise_standalone(str(output_path))
+            result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
     except Exception as e:
         print(f"  ⚠  Diarisation failed: {e}")
 
 
 def _diarise_stereo_live(result, output_path):
-    """Diarise a stereo live result by splitting channels and reassigning per side."""
+    """Diarise a stereo live result by splitting channels and reassigning per side.
+
+    Handles three segment types:
+    - _source_channel="system" — from per-channel tail/full transcribe
+    - _source_channel="mic"    — from per-channel tail/full transcribe
+    - no _source_channel       — from mixed-mono chunks transcribed during recording
+
+    Mixed-mono segments are assigned speakers by overlap against all diarised
+    turns combined (sys + mic). This is approximate but prevents data loss.
+    """
     mic_tmp, sys_tmp = _split_stereo(output_path)
     try:
-        sys_turns = _diarise_standalone(sys_tmp)
-        if not (sys_turns and "segments" in result):
+        if not ("segments" in result and result["segments"]):
             return
+        sys_turns = _diarise_standalone(sys_tmp)
+        mic_turns = _diarise_standalone(mic_tmp)
         sys_segs = [s for s in result["segments"] if s.get("_source_channel") == "system"]
         mic_segs = [s for s in result["segments"] if s.get("_source_channel") == "mic"]
+        other_segs = [s for s in result["segments"] if not s.get("_source_channel")]
         if sys_segs:
             sys_segs = _assign_speakers_to_segments(sys_segs, sys_turns)
-        if mic_segs:
-            mic_turns = _diarise_standalone(mic_tmp)
-            if mic_turns:
-                mic_segs = _assign_speakers_to_segments(mic_segs, mic_turns)
-        result["segments"] = sorted(sys_segs + mic_segs, key=lambda s: s.get("start", 0))
+            for seg in sys_segs:
+                label = seg["speaker"]
+                if label == "Unknown":
+                    label = "Remote"
+                seg["speaker"] = f"sys:{label}"
+        if mic_segs and mic_turns:
+            mic_segs = _assign_speakers_to_segments(mic_segs, mic_turns)
+            for seg in mic_segs:
+                label = seg["speaker"]
+                if label == "Unknown":
+                    label = config.get("user_name", "You") or "You"
+                seg["speaker"] = f"mic:{label}"
+        if other_segs:
+            all_turns = (sys_turns or []) + (mic_turns or [])
+            if all_turns:
+                _assign_speakers_to_segments(other_segs, all_turns)
+        result["segments"] = sorted(sys_segs + mic_segs + other_segs, key=lambda s: s.get("start", 0))
     finally:
         _cleanup_temp_files(mic_tmp, sys_tmp)
 
-
-def _diarise_mono_live(result, output_path):
-    """Diarise a mono result against the file's speaker turns."""
-    speaker_turns = _diarise_standalone(output_path)
-    result["segments"] = _assign_speakers_to_segments(result.get("segments", []), speaker_turns)
 
 
 def _save_live_transcript(result, output_path, title, model_name, language, elapsed, cp_path, recording_end, chunks_done):
@@ -1548,7 +1538,7 @@ def _save_live_transcript(result, output_path, title, model_name, language, elap
         print(f"\n  ❌ Post-processing failed: {e}")
         if cp_path:
             print(f"  ✅ Raw transcription saved to: {cp_path}")
-            print(f"  💡 Your data is safe. Re-run the command to retry formatting.")
+            print("  💡 Your data is safe. Re-run the command to retry formatting.")
         return None
 
     from ui import success_panel
@@ -1585,7 +1575,7 @@ def _build_live_state(chunk_interval):
     return {
         "mic_frames": [], "sys_frames": [],
         "recording": True, "silence_start": None,
-        "current_rms": 0.0, "mic_rms_val": 0.0, "sys_rms_val": 0.0,
+        "current_rms": 0.0, "mic_rms": 0.0, "sys_rms": 0.0,
         "start_time": time.time(), "lock": threading.Lock(),
         "last_transcribed_sample": 0, "chunks_done": 0, "chunk_in_progress": False,
         "mic_low_since": None,
@@ -1665,7 +1655,10 @@ def _setup_live_recording(state, model_name, language, dual_mode, get_snapshot):
     mic_poll_thread, transcribed_segments, transcribe_lock, stop_event,
     live_cfg, adaptive.
     """
-    sck_capture, sck_error = _open_sys_capture(sys_callback=None)
+    def sys_callback(indata, frames, time_info, status):
+        _sys_audio_callback(indata, frames, time_info, status, state=state)
+
+    sck_capture, sck_error = _open_sys_capture(sys_callback=sys_callback)
     if sck_error:
         print(f"  ⚠  System audio unavailable: {sck_error}")
         dual_mode = False
@@ -1683,7 +1676,8 @@ def _setup_live_recording(state, model_name, language, dual_mode, get_snapshot):
         daemon=True,
     )
 
-    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE)
+    vp_capture = VPMicCapture(sample_rate=SAMPLE_RATE,
+                               voice_processing=config["audio"].get("voice_processing", False))
     mic_poll_thread = threading.Thread(
         target=_mic_pump_thread,
         args=(vp_capture, state, stop_event),
@@ -1703,7 +1697,7 @@ def _post_process_live_audio(audio_data, output_path, model_name, language, live
     """Run stereo or mono post-processing depending on channel count."""
     if audio_data.ndim == 2:
         return _post_process_stereo(
-            audio_data, output_path, model_name, language, live_cfg,
+            audio_data, model_name, language, live_cfg,
             state["last_transcribed_sample"], adaptive["rec_only"], transcribed_segments)
     return _post_process_mono(
         output_path, audio_data, model_name, language, live_cfg,
@@ -1865,9 +1859,7 @@ class ProgressTracker:
     def _render(self, tick=0):
         """Build the display: completed steps + current step with spinner."""
         from rich.text import Text
-        lines = []
-        for name, dur in self._completed:
-            lines.append(f"  [green]✓[/green] {name} [dim]({dur})[/dim]")
+        lines = [f"  [green]✓[/green] {name} [dim]({dur})[/dim]" for name, dur in self._completed]
 
         if self.running:
             total_steps = len(self.step_names)
@@ -1881,12 +1873,7 @@ class ProgressTracker:
 
     def _render_final(self):
         """Render all steps as completed — becomes permanent output when Live exits."""
-        from rich.text import Text
-        lines = []
-        for name, dur in self._completed:
-            lines.append(f"  [green]✓[/green] {name} [dim]({dur})[/dim]")
-        self._live.update(Text.from_markup("\n".join(lines)))
-        self._live.refresh()
+        self._render()
 
     def _display_loop(self):
         tick = 0
@@ -1897,42 +1884,53 @@ class ProgressTracker:
 
 
 # ─── Audio Loading & Processing ───────────────────────────────────────────────
-
 def _is_stereo(audio_path):
-    """Check if an audio file is stereo (2 channels)."""
+    """Check channel count via ffprobe (format-agnostic)."""
     try:
-        import soundfile as sf
-        info = sf.info(str(audio_path))
-        return info.channels == 2
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "stream=channels",
+             "-of", "csv=p=0", str(audio_path)],
+            capture_output=True, text=True, timeout=10)
+        return result.returncode == 0 and result.stdout.strip() == "2"
     except Exception:
-        return False  # assume mono if file can't be read
+        return False
 
 
+def _decode_stereo(audio_path):
+    """Decode any stereo audio to (mic, sys, sample_rate) via ffmpeg."""
+    sr_result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "stream=sample_rate",
+         "-of", "csv=p=0", str(audio_path)],
+        capture_output=True, text=True, timeout=10)
+    sr = int(sr_result.stdout.strip()) if sr_result.returncode == 0 else SAMPLE_RATE
+    result = subprocess.run([
+        "ffmpeg", "-i", str(audio_path),
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ar", str(sr), "-ac", "2", "-v", "quiet", "-"
+    ], capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to decode {audio_path}: {result.stderr.decode()[:200]}")
+    audio = np.frombuffer(result.stdout, dtype=np.float32).reshape(-1, 2)
+    return audio[:, 0], audio[:, 1], sr
 
 
-
-def _split_stereo(audio_path, sr=16000):
-    """Split a stereo WAV into two mono temp files (mic, system).
+def _split_stereo(audio_path):
+    """Split a stereo file into two mono temp files (mic, system).
 
     Returns (mic_path, sys_path) as temp file paths. Caller must clean up.
     """
-    import soundfile as sf
-    data, file_sr = sf.read(str(audio_path), dtype="float32")
-    if data.ndim == 1:
-        return None, None  # mono file
-    mic = data[:, 0]
-    sys_audio = data[:, 1]
+    mic, sys_audio, sr = _decode_stereo(audio_path)
     mic_fd, mic_path = tempfile.mkstemp(suffix="_mic.wav")
     sys_fd, sys_path = tempfile.mkstemp(suffix="_sys.wav")
     os.close(mic_fd)
     os.close(sys_fd)
     try:
-        sf.write(mic_path, mic, file_sr, subtype="PCM_16")
-        sf.write(sys_path, sys_audio, file_sr, subtype="PCM_16")
+        _write_wav(mic_path, mic, sr)
+        _write_wav(sys_path, sys_audio, sr)
     except Exception:
         _cleanup_temp_files(mic_path, sys_path)
         raise
-    _log("split", duration=f"{len(mic)/file_sr:.1f}s",
+    _log("split", duration=f"{len(mic)/sr:.1f}s",
          mic_rms=f"{np.sqrt(np.mean(mic**2)):.5f}",
          sys_rms=f"{np.sqrt(np.mean(sys_audio**2)):.5f}")
     return mic_path, sys_path
@@ -2070,8 +2068,6 @@ def _denoise_audio(audio_path):
     """
     denoise_cfg = config["denoise"]
 
-    import soundfile as sf
-
     factor = denoise_cfg["factor"]
     profile_secs = denoise_cfg["noise_profile_seconds"]
     sr = SAMPLE_RATE
@@ -2118,7 +2114,7 @@ def _denoise_audio(audio_path):
         # Write to temp file next to the original
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix=".denoise_")
         os.close(tmp_fd)
-        sf.write(tmp_path, denoised, sr)
+        _write_wav(tmp_path, denoised, sr)
 
         elapsed = time.time() - t0
         noise_rms = float(np.sqrt(np.mean(noise_clip ** 2)))
@@ -2194,14 +2190,10 @@ def _transcribe_parakeet(audio_path, model_name="parakeet"):
     result = model.generate(audio_path, chunk_duration=chunk_dur, verbose=False)
 
     # Convert Parakeet sentences to Whisper-compatible segments
-    segments = []
-    for i, sentence in enumerate(result.sentences):
-        segments.append({
-            "id": i,
-            "start": sentence.start,
-            "end": sentence.end,
-            "text": sentence.text,
-        })
+    segments = [
+        {"id": i, "start": s.start, "end": s.end, "text": s.text}
+        for i, s in enumerate(result.sentences)
+    ]
 
     words = sum(len(s.get("text", "").split()) for s in segments)
     speech_dur = sum(s.get("end", 0) - s.get("start", 0) for s in segments)
@@ -2220,12 +2212,10 @@ def _transcribe_chunk(chunk, model_name, language="en"):
     Works with both Parakeet and Whisper models.
     Returns the transcription result dict.
     """
-    import soundfile as sf
-
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, chunk, SAMPLE_RATE)
+            _write_wav(tmp.name, chunk, SAMPLE_RATE)
             tmp_path = tmp.name
         return _transcribe_audio(tmp_path, model_name, language, word_timestamps=True)
     finally:
@@ -2239,7 +2229,6 @@ def _diarise_mlx_audio(audio_path):
     Max 4 speakers (architectural limit of Sortformer model).
     """
     from mlx_audio.vad import load as load_vad
-    import mlx.core as mx
 
     diar_config = config["diarization"]
     model_id = diar_config["mlx_model"]
@@ -2260,20 +2249,18 @@ def _diarise_mlx_audio(audio_path):
         merge_gap=merge_gap,
         verbose=False,
     ):
-        for seg in chunk_result.segments:
-            turns.append({
-                "start": seg.start,
-                "end": seg.end,
-                "speaker": f"Speaker {seg.speaker}",
-            })
+        turns.extend({
+            "start": seg.start,
+            "end": seg.end,
+            "speaker": f"Speaker {seg.speaker}",
+        } for seg in chunk_result.segments)
 
     speakers = set(t["speaker"] for t in turns)
     _log("diar", speakers=len(speakers), turns=len(turns),
          labels=sorted(speakers))
 
     del model
-    gc.collect()
-    mx.clear_cache()
+    _mx_cleanup()
     return turns
 
 
@@ -2373,20 +2360,13 @@ def _build_run_steps_preview(is_stereo, diarise, denoise):
     """Return a short human-readable pipeline summary for the info panel."""
     denoise_prefix = "Denoise → " if denoise else ""
     if is_stereo and diarise:
-        return f"{denoise_prefix}Diarise system → Transcribe mic + system → Save"
+        return f"{denoise_prefix}Diarise mic + system → Transcribe mic + system → Save"
     if is_stereo:
         return f"{denoise_prefix}Transcribe mic + system → Save"
     if diarise:
         return f"{denoise_prefix}Diarise → Transcribe → Save"
     return f"{denoise_prefix}Transcribe → Save"
 
-
-def _print_run_info_panel(rows):
-    """Print the run-time info panel."""
-    from ui import info_panel
-    print()
-    info_panel("📝 Transcription", rows)
-    print()
 
 
 def _build_run_step_names(diarise_enabled, denoise_enabled):
@@ -2408,12 +2388,11 @@ def _run_normalise_step(transcribe_path, is_stereo, normalise_enabled):
     """Normalise a mono file to a temp wav. Returns (normalised_path_or_none)."""
     if not (normalise_enabled and not is_stereo):
         return None
-    import soundfile as sf
     audio_data = _load_audio(transcribe_path, sr=SAMPLE_RATE)
     audio_data = _normalise(audio_data)
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix=".norm_")
     os.close(tmp_fd)
-    sf.write(tmp_path, audio_data, SAMPLE_RATE)
+    _write_wav(tmp_path, audio_data, SAMPLE_RATE)
     return tmp_path
 
 
@@ -2427,15 +2406,19 @@ def _diarise_stereo_channels(mic_path, sys_path, diarise_enabled, progress, step
     """
     if not diarise_enabled:
         return None, None, step
-    import mlx.core as mx
     progress.set_step(step)
     sys_turns = _diarise_standalone(sys_path)
-    gc.collect()
-    mx.clear_cache()
+    _mx_cleanup()
     mic_turns = _diarise_standalone(mic_path)
-    gc.collect()
-    mx.clear_cache()
+    _mx_cleanup()
     return sys_turns, mic_turns, step + 1
+
+
+def _mx_cleanup():
+    """Release MLX memory after model operations."""
+    gc.collect()
+    import mlx.core as mx
+    mx.clear_cache()
 
 
 def _label_mic_segments(mic_result, mic_turns):
@@ -2443,6 +2426,11 @@ def _label_mic_segments(mic_result, mic_turns):
     segments = mic_result.get("segments", [])
     if mic_turns:
         mic_result["segments"] = _assign_speakers_to_segments(segments, mic_turns)
+        for seg in mic_result["segments"]:
+            label = seg["speaker"]
+            if label == "Unknown":
+                label = config.get("user_name", "You") or "You"
+            seg["speaker"] = f"mic:{label}"
     else:
         mic_label = config.get("user_name", "You") or "You"
         for seg in segments:
@@ -2454,6 +2442,11 @@ def _label_sys_segments(sys_result, sys_turns):
     segments = sys_result.get("segments", [])
     if sys_turns:
         sys_result["segments"] = _assign_speakers_to_segments(segments, sys_turns)
+        for seg in sys_result["segments"]:
+            label = seg["speaker"]
+            if label == "Unknown":
+                label = "Remote"
+            seg["speaker"] = f"sys:{label}"
     else:
         for seg in segments:
             seg["speaker"] = "Remote"
@@ -2461,11 +2454,10 @@ def _label_sys_segments(sys_result, sys_turns):
 
 def _normalise_stereo_channels(mic_path, sys_path):
     """Normalise each split stereo channel in place."""
-    import soundfile as sf
     for ch_path in (mic_path, sys_path):
         ch_audio = _load_audio(ch_path, sr=SAMPLE_RATE)
         ch_audio = _normalise(ch_audio)
-        sf.write(ch_path, ch_audio, SAMPLE_RATE)
+        _write_wav(ch_path, ch_audio, SAMPLE_RATE)
 
 
 
@@ -2476,7 +2468,6 @@ def _run_stereo_pipeline(transcribe_path, model_name, language, normalise_enable
     No echo dedup — VPIO at the recording layer has already removed system
     bleed from the mic channel, so transcript-level dedup would be a no-op.
     """
-    import mlx.core as mx
     mic_path, sys_path = _split_stereo(transcribe_path)
     if normalise_enabled:
         _normalise_stereo_channels(mic_path, sys_path)
@@ -2485,8 +2476,7 @@ def _run_stereo_pipeline(transcribe_path, model_name, language, normalise_enable
             mic_path, sys_path, diarise_enabled, progress, step)
         progress.set_step(step)
         mic_result = _transcribe_audio(mic_path, model_name, language)
-        gc.collect()
-        mx.clear_cache()
+        _mx_cleanup()
         sys_result = _transcribe_audio(sys_path, model_name, language)
         _label_sys_segments(sys_result, sys_turns)
         _label_mic_segments(mic_result, mic_turns)
@@ -2497,13 +2487,11 @@ def _run_stereo_pipeline(transcribe_path, model_name, language, normalise_enable
 
 def _run_mono_pipeline(transcribe_path, model_name, language, diarise_enabled, progress, step):
     """Run the mono ASR pipeline (single channel). Returns (result, next_step)."""
-    import mlx.core as mx
     speaker_turns = None
     if diarise_enabled:
         progress.set_step(step)
         speaker_turns = _diarise_standalone(transcribe_path)
-        gc.collect()
-        mx.clear_cache()
+        _mx_cleanup()
         step += 1
     progress.set_step(step)
     result = _transcribe_audio(transcribe_path, model_name, language,
@@ -2530,8 +2518,7 @@ def _print_run_success_panel(audio_duration, model_name, speaker_names, result, 
         parts = [f"{step_names[i]}: {format_duration(step_times[i])}" for i in range(len(step_names)) if i in step_times]
         if parts:
             rows.append(("Steps:", parts[0]))
-            for part in parts[1:]:
-                rows.append(("", part))
+            rows.extend(("", part) for part in parts[1:])
     rows.append(("Saved to:", f"Scripts/{output_file.name}"))
     print()
     success_panel("✅ Transcription complete!", rows)
@@ -2565,15 +2552,6 @@ def _log_run_entry(opts, result, speaker_names, total_time, step_names, step_tim
         "stereo": opts["is_stereo_input"],
     }, step_log)
 
-
-def _run_save_step(result, audio_path, title, model_name, language,
-                  audio_duration, total_time, cp_path):
-    """Save the transcript, print success panel, open folder, log, maybe delete source."""
-    output_file, speaker_names = _save_transcript(
-        result, audio_path, title, model_name, language,
-        audio_duration, total_time, cp_path,
-    )
-    return output_file, speaker_names
 
 
 def _resolve_run_options(args, audio_path):
@@ -2626,6 +2604,7 @@ def _resolve_run_options(args, audio_path):
 
 def _print_run_info_rows(opts):
     """Print the run info panel from a resolved options dict."""
+    from ui import info_panel
     rows = [
         ("File:", Path(opts["audio_path"]).name),
         ("Duration:", format_duration(opts["audio_duration"])),
@@ -2640,7 +2619,9 @@ def _print_run_info_rows(opts):
         ("Est time:", f"~{format_duration(opts['estimated_time'])}"),
         ("Started:", datetime.now().strftime("%H:%M:%S")),
     ]
-    _print_run_info_panel(rows)
+    print()
+    info_panel("📝 Transcription", rows)
+    print()
 
 
 def _execute_pipeline(opts, progress, step):
@@ -2680,7 +2661,7 @@ def _handle_pipeline_failure(e, progress, result, opts):
     cp_path = _save_checkpoint(result, opts["audio_path"], opts["title"])
     if cp_path:
         print(f"  ✅ Partial transcription saved to: {cp_path}")
-        print(f"  💡 Re-run with --no-diarise to use the transcription without speakers.")
+        print("  💡 Re-run with --no-diarise to use the transcription without speakers.")
 
 
 def _finalize_run(result, opts, progress, step_names):
@@ -2689,7 +2670,7 @@ def _finalize_run(result, opts, progress, step_names):
     try:
         total_time = time.time() - progress.start_time
         step_times = getattr(progress, "_step_times", {})
-        output_file, speaker_names = _run_save_step(
+        output_file, speaker_names = _save_transcript(
             result, opts["audio_path"], opts["title"], opts["model_name"], opts["language"],
             opts["audio_duration"], total_time, cp_path,
         )
@@ -2704,7 +2685,7 @@ def _finalize_run(result, opts, progress, step_names):
         print(f"\n  ❌ Post-processing failed: {e}")
         if cp_path:
             print(f"  ✅ Raw transcription saved to: {cp_path}")
-            print(f"  💡 Your data is safe. Re-run the command to retry formatting.")
+            print("  💡 Your data is safe. Re-run the command to retry formatting.")
 
 
 def _cleanup_temp_artifacts(audio_path, denoised_path, normalised_path):
@@ -2774,10 +2755,7 @@ def cmd_list(args):
     table.add_column("name")
     table.add_column("info", style="dim")
     # Pre-load transcript date prefixes to avoid re-globbing per recording
-    transcript_dates = set()
-    if SCRIPTS_DIR.exists():
-        for md in SCRIPTS_DIR.glob("*.md"):
-            transcript_dates.add(md.stem[:10])
+    transcript_dates = {md.stem[:10] for md in SCRIPTS_DIR.glob("*.md")} if SCRIPTS_DIR.exists() else set()
     for i, rec in enumerate(recordings[:max_list], 1):
         duration = get_audio_duration(str(rec))
         size_mb = rec.stat().st_size / (1024 * 1024)
@@ -2790,14 +2768,13 @@ def cmd_list(args):
     console.print("  [dim]✅ = transcript exists[/dim]")
     print()
 
-    if recordings:
-        try:
-            choice = input("  Transcribe one? Enter number (or Enter to skip): ").strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(recordings):
-                selected = recordings[int(choice) - 1]
-                prompt_transcribe(str(selected))
-        except (EOFError, KeyboardInterrupt):
-            print()
+    try:
+        choice = input("  Transcribe one? Enter number (or Enter to skip): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(recordings):
+            selected = recordings[int(choice) - 1]
+            prompt_transcribe(str(selected))
+    except (EOFError, KeyboardInterrupt):
+        print()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -2817,11 +2794,7 @@ def extract_recording_date(audio_path):
 
 def list_recordings(directory):
     """List all audio files in directory, sorted newest first."""
-    files = []
-    if directory.exists():
-        for f in directory.iterdir():
-            if f.suffix.lower() in AUDIO_FORMATS:
-                files.append(f)
+    files = [f for f in directory.iterdir() if f.suffix.lower() in AUDIO_FORMATS] if directory.exists() else []
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -2832,13 +2805,7 @@ def get_last_recording():
 
 
 def get_audio_duration(audio_path):
-    """Get audio duration in seconds. Tries soundfile first, then ffprobe."""
-    try:
-        import soundfile as sf
-        info = sf.info(audio_path)
-        return info.duration
-    except Exception:
-        pass
+    """Get audio duration in seconds via ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -2960,14 +2927,19 @@ def _rename_speakers(result):
 
     Preserves human-readable labels set by the stereo pipeline (You, Remote,
     Local N, Unknown, or a configured user_name).
+
+    Handles channel-prefixed labels ("mic:Speaker 0", "sys:Speaker 0") from the
+    stereo diarisation pipeline — these must be treated as distinct speakers
+    because Sortformer runs independently per channel.
     """
     raw_pat = re.compile(r"^(SPEAKER_\d+|Speaker \d+)$")
+    chan_pat = re.compile(r"^(mic|sys):(Speaker \d+|SPEAKER_\d+)$")
     segments = result.get("segments") or []
     speaker_ids = sorted(set(seg.get("speaker", "Unknown") for seg in segments))
     name_map = {}
     counter = 1
     for sid in speaker_ids:
-        if raw_pat.match(sid):
+        if chan_pat.match(sid) or raw_pat.match(sid):
             name_map[sid] = f"Speaker {counter}"
             counter += 1
         else:
@@ -2975,7 +2947,7 @@ def _rename_speakers(result):
     if len(name_map) > 1:
         print(f"  🔊 {len(name_map)} speakers detected")
     if len(name_map) >= 4:
-        print(f"  ⚠  Sortformer supports max 4 speakers per channel — some speakers may be merged")
+        print("  ⚠  Sortformer supports max 4 speakers per channel — some speakers may be merged")
     _log("speakers", count=len(name_map), labels=list(name_map.values()))
     return name_map
 
@@ -3129,7 +3101,6 @@ def _sleep_until_idle_or_refresh(refresh_hours):
 
     Returns False if interrupted by the user.
     """
-    from datetime import timedelta
     now = datetime.now()
     tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     next_refresh = now + timedelta(hours=refresh_hours)
@@ -3260,7 +3231,6 @@ def _record_one_event(event, model_name, record_only, end_buffer, min_recording)
 
     Returns False if the user hit Ctrl-C (watch should exit).
     """
-    from datetime import timedelta
     _watch_log(f"⏺  \"{event['title']}\" — auto-recording started")
     stop_time = event["end"] + timedelta(minutes=end_buffer)
     proc = _start_recording_subprocess(event["title"], model_name, record_only)
@@ -3419,7 +3389,6 @@ def cmd_watch_status(args):
         print(f"  📋 Log:   {WATCH_LOG}")
         # Show last 5 log lines
         try:
-            from collections import deque
             with open(WATCH_LOG) as f:
                 tail = deque(f, maxlen=5)
             print()

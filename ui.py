@@ -66,24 +66,26 @@ def rms_colour(rms):
     return "yellow" if rms > _RMS_LOW else "red"
 
 
-def info_panel(title, rows, *, subtitle=None):
+def info_panel(title, rows, *, subtitle=None, style="dim"):
     """Display an info box with label: value rows.
 
     Args:
         title: Panel title (e.g. "Recording", "Transcription")
         rows: list of (label, value) tuples
         subtitle: optional text below the border
+        style: border style ("dim" for info, "green" for success)
     """
     table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     table.add_column("label", style="dim", no_wrap=True, min_width=10)
     table.add_column("value")
     for label, value in rows:
         table.add_row(label, str(value))
+    title_markup = f"[bold green]{title}[/bold green]" if style == "green" else f"[bold]{title}[/bold]"
     console.print(Panel(
         table,
-        title=f"[bold]{title}[/bold]",
+        title=title_markup,
         subtitle=subtitle,
-        border_style="dim",
+        border_style=style,
         expand=False,
         width=54,
     ))
@@ -91,18 +93,7 @@ def info_panel(title, rows, *, subtitle=None):
 
 def success_panel(title, rows):
     """Display a green-bordered completion box."""
-    table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
-    table.add_column("label", style="dim", no_wrap=True, min_width=10)
-    table.add_column("value")
-    for label, value in rows:
-        table.add_row(label, str(value))
-    console.print(Panel(
-        table,
-        title=f"[bold green]{title}[/bold green]",
-        border_style="green",
-        expand=False,
-        width=54,
-    ))
+    info_panel(title, rows, style="green")
 
 
 # ── System health ─────────────────────────────────────────────────────────────
@@ -141,10 +132,13 @@ def _waveform(rms_history, width=24):
     return "".join(chars).ljust(width)
 
 
+_QUALITY_LABELS = {"green": "Good", "yellow": "Low", "red": "Silent"}
+
+
 def _quality_indicator(rms):
     """Return colored quality label for current RMS."""
     c = rms_colour(rms)
-    label = "Good" if c == "green" else ("Low" if c == "yellow" else "Silent")
+    label = _QUALITY_LABELS.get(c, "Silent")
     return f"[{c}]● {label}[/{c}]"
 
 
@@ -192,10 +186,6 @@ class RecordingDisplay:
     def __exit__(self, *args):
         self._live.__exit__(*args)
 
-    def set_warning(self, msg):
-        """Set a warning message (or None to clear)."""
-        self._warnings = [msg] if msg else []
-
     def update(self, rms, elapsed, silence_elapsed, paused=False,
                mic_rms=None, sys_rms=None):
         """Refresh the display with current audio state."""
@@ -231,8 +221,7 @@ class RecordingDisplay:
             if silence_elapsed > 0:
                 parts[0] += f"  [dim]silence {int(silence_elapsed)}s[/dim]"
 
-        for w in self._warnings:
-            parts.append(f"  [yellow]⚠ {w}[/yellow]")
+        parts.extend(f"  [yellow]⚠ {w}[/yellow]" for w in self._warnings)
 
         text = Text.from_markup("\n".join(parts))
         self._live.update(text)
