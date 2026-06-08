@@ -124,14 +124,18 @@ DEFAULT_CONFIG = {
         "enabled": True,
         # Sortformer model (max 4 speakers per channel)
         "mlx_model": "mlx-community/diar_streaming_sortformer_4spk-v2.1-fp16",
-        # Chunk duration in seconds for streaming mode (lower = less RAM)
-        "mlx_chunk_duration": 10.0,
+        # Chunk duration in seconds for streaming mode (higher = more acoustic context)
+        "mlx_chunk_duration": 20.0,
         # Speaker activity threshold (0-1). Lower = catch more speech, higher = fewer false positives
         "threshold": 0.5,
         # Ignore speaker segments shorter than this (seconds). Filters micro-segments
-        "min_duration": 0.0,
+        "min_duration": 0.1,
         # Merge segments from same speaker closer than this gap (seconds). Reduces fragmentation
-        "merge_gap": 0.0,
+        "merge_gap": 0.2,
+        # AOSC speaker cache size in frames (188 frames = ~15s). Larger = better speaker tracking
+        "spkcache_max": 752,
+        # FIFO buffer size in frames (188 frames = ~15s). Larger = more recent context
+        "fifo_max": 752,
     },
 
     # ── Live mode (record + transcribe simultaneously) ───────────────────
@@ -190,10 +194,10 @@ DEFAULT_CONFIG = {
         # without preprocessing (+6-14% WER increase with denoise on).
         # Enable with --denoise flag for recordings with heavy constant noise
         # that start with silence (first N seconds used as noise profile).
-        "enabled": False,
+        "enabled": True,
         # Over-subtraction factor: how aggressively to remove noise.
-        # 2.0 = balanced (recommended). Higher = more removal but risks speech distortion.
-        "factor": 2.0,
+        # 1.0 = conservative (recommended). Higher = more removal but risks speech distortion.
+        "factor": 1.0,
         # Seconds of audio to use as noise profile.
         "noise_profile_seconds": 3,
         # FFT window size and hop for spectral subtraction (advanced)
@@ -2223,41 +2227,61 @@ def _transcribe_chunk(chunk, model_name, language="en"):
 
 
 def _diarise_mlx_audio(audio_path):
-    """Run speaker diarisation using MLX Sortformer (fast, Apple GPU).
+    """Speaker diarisation using Sortformer's native streaming (AOSC).
 
-    Uses streaming mode to keep RAM usage low on 16GB machines.
-    Max 4 speakers (architectural limit of Sortformer model).
+    Uses generate_stream() which maintains speaker identity across chunks
+    via the model's Arrival-Order Speaker Cache. More accurate than manual
+    chunking + Hungarian matching.
     """
     from mlx_audio.vad import load as load_vad
+    from mlx_audio.vad.models.sortformer.sortformer import DiarizationSegment
 
     diar_config = config["diarization"]
-    model_id = diar_config["mlx_model"]
-    chunk_duration = diar_config["mlx_chunk_duration"]
-    threshold = diar_config["threshold"]
-    min_duration = diar_config["min_duration"]
-    merge_gap = diar_config["merge_gap"]
+    model = load_vad(diar_config["mlx_model"])
 
-    model = load_vad(model_id)
-
-    # Streaming mode — processes in chunks, uses much less RAM
-    turns = []
-    for chunk_result in model.generate_stream(
+    all_segs = []
+    for res in model.generate_stream(
         audio_path,
-        chunk_duration=chunk_duration,
-        threshold=threshold,
-        min_duration=min_duration,
-        merge_gap=merge_gap,
-        verbose=False,
+        sample_rate=16000,
+        chunk_duration=diar_config["mlx_chunk_duration"],
+        threshold=diar_config["threshold"],
+        min_duration=diar_config["min_duration"],
+        merge_gap=diar_config["merge_gap"],
+        spkcache_max=diar_config["spkcache_max"],
+        fifo_max=diar_config["fifo_max"],
     ):
-        turns.extend({
-            "start": seg.start,
-            "end": seg.end,
-            "speaker": f"Speaker {seg.speaker}",
-        } for seg in chunk_result.segments)
+        all_segs.extend(res.segments)
 
-    speakers = set(t["speaker"] for t in turns)
-    _log("diar", speakers=len(speakers), turns=len(turns),
-         labels=sorted(speakers))
+    all_segs.sort(key=lambda s: (s.start, s.speaker))
+    mg = diar_config["merge_gap"]
+    merged = []
+    for seg in all_segs:
+        if not merged or merged[-1].speaker != seg.speaker:
+            merged.append(seg)
+        elif seg.start - merged[-1].end <= mg:
+            merged[-1] = DiarizationSegment(
+                start=merged[-1].start, end=seg.end, speaker=merged[-1].speaker)
+        else:
+            merged.append(seg)
+
+    spk_dur = {}
+    for seg in merged:
+        spk_dur[seg.speaker] = spk_dur.get(seg.speaker, 0.0) + (seg.end - seg.start)
+    total_dur = sum(spk_dur.values()) or 1.0
+    min_dur = min(2.0, total_dur * 0.01)
+    active = sorted(s for s, d in spk_dur.items() if d >= min_dur)
+    remap = {old: new for new, old in enumerate(active)}
+    if len(active) < len(spk_dur):
+        dropped = sorted(set(spk_dur) - set(active))
+        _log("diar_filter", dropped=[f"Speaker {s} ({spk_dur[s]:.1f}s)" for s in dropped],
+             kept=[f"Speaker {s} ({spk_dur[s]:.1f}s)" for s in active])
+        merged = [DiarizationSegment(start=s.start, end=s.end, speaker=remap[s.speaker])
+                  for s in merged if s.speaker in remap]
+
+    turns = [{"start": s.start, "end": s.end, "speaker": f"Speaker {s.speaker}"} for s in merged]
+
+    labels = sorted({t["speaker"] for t in turns})
+    _log("diar", speakers=len(labels), turns=len(turns), labels=labels)
 
     del model
     _mx_cleanup()
